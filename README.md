@@ -4,10 +4,10 @@ A local failure log for Claude Code, Codex, and OpenCode. Hooks record each
 failed tool call as a redacted JSONL event with enough context to diagnose it,
 then ask the agent to attach a short note to that same event.
 
-Requires Python 3.9+. The OpenCode adapter uses its plugin API and Node runtime.
-This proof of concept was built against Claude Code 2.1.285, Codex CLI 0.159.0,
-and OpenCode 1.18.32 on Linux. Registration and isolated payload tests are not
-proof of delivery in live sessions; macOS and other versions are untested.
+Requires Python 3.9+. Live sessions on Linux were checked with Claude Code
+2.1.285 and Codex CLI 0.159.0. The OpenCode adapter targets the 1.x plugin API
+(built against 1.18.32). OpenCode 2.x refuses to load it and its new plugin API
+has no tool execution hooks, so OpenCode 2.x records nothing. macOS is untested.
 
 ```sh
 python3 friction.py install all
@@ -81,7 +81,8 @@ Group by `id`/`event` to join them, e.g.
 | `harness.agent` | `agent_type` (subagents) | none | `chat.params` agent |
 
 Codex Bash commands are wrapped by a `PreToolUse` hook so the exit status and
-start time are recoverable from the result. Manual reports infer the harness
+start time are recoverable from the result. That duration spans both hooks, so
+it includes roughly 100ms of hook overhead. Manual reports infer the harness
 from `CODEX_THREAD_ID`, `OPENCODE`, or `AI_AGENT`; nested harnesses are best
 effort.
 
