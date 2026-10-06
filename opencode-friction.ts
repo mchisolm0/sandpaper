@@ -3,18 +3,25 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
 const run = promisify(execFile);
+// friction.py redacts and keeps only a short tail; this just bounds the stdin payload.
+const OUTPUT_TAIL = 65_536;
+
+type Call = { sessionID: string; callID: string; tool: string; input: unknown; response: unknown; durationMs?: number };
 
 export const Friction: Plugin = async ({ directory }) => {
   const reminders = new Map<string, string>();
   const pending = new Map<string, Promise<void>>();
-  const record = async (sessionID: string, callID: string, tool: string, input: unknown, response: unknown) => {
+  const started = new Map<string, number>();
+  const agents = new Map<string, { model: string; agent: string }>();
+  const record = async ({ sessionID, callID, tool, input, response, durationMs }: Call) => {
     try {
       const process = run("python3", [__FRICTION_SCRIPT__, "opencode"], {
         cwd: directory, timeout: 40_000,
       });
       process.child.stdin?.end(JSON.stringify({
-        hook_event_name: "PostToolUse", session_id: sessionID, tool_use_id: callID,
-        tool_name: tool, tool_input: input, tool_response: response,
+        hook_event_name: "PostToolUse", session_id: sessionID, tool_use_id: callID, cwd: directory,
+        tool_name: tool, tool_input: input, tool_response: response, duration_ms: durationMs,
+        ...agents.get(sessionID),
       }));
       const { stdout } = await process;
       const reminder: unknown = stdout.trim() ? JSON.parse(stdout) : undefined;
@@ -24,15 +31,28 @@ export const Friction: Plugin = async ({ directory }) => {
     }
   };
   return {
+    "chat.params": async ({ sessionID, agent, model }) => {
+      agents.set(sessionID, { model: `${model.providerID}/${model.id}`, agent });
+    },
+    "tool.execute.before": async ({ callID }) => {
+      started.set(callID, Date.now());
+    },
     "tool.execute.after": async ({ tool, sessionID, callID, args }, output) => {
+      const start = started.get(callID);
+      started.delete(callID);
       const exitCode = output.metadata?.exit;
       if (typeof exitCode !== "number" || exitCode === 0 || output.metadata?.interrupted === true) return;
-      const reminder = await record(sessionID, callID, tool, args, { exit_code: exitCode });
+      const reminder = await record({
+        sessionID, callID, tool, input: args,
+        response: { exit_code: exitCode, output: output.output.slice(-OUTPUT_TAIL) },
+        durationMs: start === undefined ? undefined : Date.now() - start,
+      });
       if (reminder) output.output += `\n${reminder}`;
     },
     event: async ({ event }) => {
       if (event.type === "session.deleted") {
         reminders.delete(event.properties.info.id);
+        agents.delete(event.properties.info.id);
         return;
       }
       if (event.type !== "message.part.updated") return;
@@ -40,10 +60,13 @@ export const Friction: Plugin = async ({ directory }) => {
       if (part.type !== "tool") return;
       const state = part.state;
       if (state.status !== "error") return;
+      started.delete(part.callID);
       if (state.metadata?.interrupted === true) return;
       const recording = (async () => {
-        const reminder = await record(part.sessionID, part.callID, part.tool, state.input,
-          { status: state.status, error: state.error });
+        const reminder = await record({
+          sessionID: part.sessionID, callID: part.callID, tool: part.tool, input: state.input,
+          response: { status: state.status, error: state.error }, durationMs: state.time.end - state.time.start,
+        });
         if (reminder) reminders.set(part.sessionID, reminder);
       })();
       const waiting = Promise.all([pending.get(part.sessionID), recording]).then(() => {});
