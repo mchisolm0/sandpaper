@@ -93,6 +93,20 @@ class HookTest(unittest.TestCase):
         self.assertIn("SessionStart", json.loads(settings.read_text())["hooks"])
         self.assertFalse((self.home / ".config/opencode/plugins/friction.ts").exists())
 
+    def test_opencode_plugin_follows_installed_major_version(self):
+        bin_dir = self.home / "bin"
+        bin_dir.mkdir()
+        fake = bin_dir / "opencode"
+        self.env["PATH"] = f"{bin_dir}{os.pathsep}{self.env['PATH']}"
+        plugin = self.home / ".config/opencode/plugins/friction.ts"
+        for version, marker in (("1.18.32", "tool.execute.after"), ("2.0.23", "setup:")):
+            fake.write_text(f"#!/bin/sh\necho {version}\n")
+            fake.chmod(0o755)
+            self.run_script("install", "opencode")
+            self.assertIn(marker, plugin.read_text())
+        plugin.write_text("// someone else's plugin\n")
+        self.assertNotEqual(self.run_script("install", "opencode", check=False).returncode, 0)
+
     def test_failure_event_then_linked_note(self):
         event = self.claude_failure("call", "API_TOKEN=abc123secret pnpm build",
                                     "Exit code 2\nbuild failed with token abc123secret")
@@ -121,8 +135,11 @@ class HookTest(unittest.TestCase):
     def test_search_without_match_is_low_signal(self):
         output = self.run_script("claude", event=self.claude_failure("rg", "rg -n needle src", "Exit code 1")).stdout
         self.run_script("claude", event=self.claude_failure("cd", "cd missing && rg needle", "Exit code 1\ncd: no such directory"))
-        low, high = self.records()
-        self.assertEqual((low["signal"], high["signal"]), ("low", "high"))
+        self.run_script("opencode", event={
+            "hook_event_name": "PostToolUse", "session_id": "session", "tool_use_id": "oc", "tool_name": "shell",
+            "tool_input": {"command": "cd . && rg needle"}, "tool_response": {"exit_code": 1, "output": ""}})
+        low, high, compound = self.records()
+        self.assertEqual((low["signal"], high["signal"], compound["signal"]), ("low", "high", "low"))
         self.assertEqual(output, "")
 
     def test_manual_report_captures_context(self):

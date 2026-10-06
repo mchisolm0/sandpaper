@@ -165,9 +165,11 @@ def response_text(response):
     if isinstance(response, str):
         return re.sub(r"\AExit code -?\d+\n?", "", response)
     result = object_value(response)
-    parts = [result.get(name) for name in ("output", "stdout", "stderr", "error")]
-    text = "\n".join(part for part in parts if isinstance(part, str) and part)
-    return text or (json.dumps(response, ensure_ascii=False) if response else None)
+    parts = [result[name] for name in ("output", "stdout", "stderr", "error") if isinstance(result.get(name), str)]
+    if parts:
+        # Empty output stays empty: low-signal detection treats "printed nothing" as meaningful.
+        return "\n".join(part for part in parts if part)
+    return json.dumps(response, ensure_ascii=False) if response else None
 
 
 def command_names(command):
@@ -276,6 +278,7 @@ def observe(source, event):
         "cwd": event.get("cwd"), "session_id": event.get("session_id"), "turn_id": event.get("turn_id"),
         "model": event.get("model"), "agent": event.get("agent_type", event.get("agent")),
         "permission_mode": event.get("permission_mode"), "transcript_path": event.get("transcript_path"),
+        "harness_version": event.get("harness_version"),
     }
 
 
@@ -376,7 +379,7 @@ def capture(source, failure):
     command = failure.get("command")
     shell = isinstance(command, str)
     harness = harness_name(source)
-    version = harness_version(harness)
+    version = failure.get("harness_version") or harness_version(harness)
     probes = {
         "repo": ["git", "rev-parse", "--show-toplevel", "HEAD", "--abbrev-ref", "HEAD"],
         "remote": ["git", "config", "--get", "remote.origin.url"],
@@ -570,18 +573,31 @@ def edit_hooks(agent, action):
     return all(present)
 
 
+def opencode_plugins():
+    """Rendered plugin sources as (for the installed OpenCode, for the other major version)."""
+    script = json.dumps(str(Path(__file__).resolve()))
+    v1, v2 = (Path(__file__).with_name(name).read_text().replace("__FRICTION_SCRIPT__", script)
+              for name in ("opencode-friction.ts", "opencode-friction-v2.ts"))
+    # OpenCode 2 only loads plugins with a default {id, setup} export; 1.x expects named hook factories.
+    version = run_probes({"opencode": ["opencode", "--version"]}, None).get("opencode", "")
+    major = re.search(r"(\d+)\.\d+", version)
+    return (v1, v2) if major and int(major[1]) < 2 else (v2, v1)
+
+
 def edit_opencode(action):
     target = Path.home() / ".config/opencode/plugins/friction.ts"
-    script = str(Path(__file__).resolve())
-    content = Path(__file__).with_name("opencode-friction.ts").read_text().replace("__FRICTION_SCRIPT__", json.dumps(script))
-    installed = target.exists() and target.read_text() == content
+    content, other = opencode_plugins()
+    existing = target.read_text() if target.exists() else None
+    installed = existing == content
     if action == "install" and not installed:
-        if target.exists() or target.is_symlink():
+        # Replace our own plugin for the other OpenCode version, but never someone else's file.
+        if (existing is not None and existing != other) or (existing is None and target.is_symlink()):
             raise ValueError(f"existing plugin differs: {target}")
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content)
-    elif action == "uninstall" and installed:
+    elif action == "uninstall" and existing in (content, other):
         target.unlink()
+        return True
     return installed
 
 

@@ -5,9 +5,13 @@ failed tool call as a redacted JSONL event with enough context to diagnose it,
 then ask the agent to attach a short note to that same event.
 
 Requires Python 3.9+. Live sessions on Linux were checked with Claude Code
-2.1.285 and Codex CLI 0.159.0. The OpenCode adapter targets the 1.x plugin API
-(built against 1.18.32). OpenCode 2.x refuses to load it and its new plugin API
-has no tool execution hooks, so OpenCode 2.x records nothing. macOS is untested.
+2.1.285, Codex CLI 0.159.0, and OpenCode 2.0.23. OpenCode has two plugins:
+`opencode-friction-v2.ts` for 2.x and `opencode-friction.ts` for 1.x (built
+against 1.18.32, not rechecked). The installer picks one from
+`opencode --version` and swaps it after an upgrade, so rerun `install` when
+OpenCode changes major version. The 2.x plugin uses hooks OpenCode passes at
+runtime but does not yet publish types for, so it may need updates as that API
+settles. macOS is untested.
 
 ```sh
 python3 friction.py install all
@@ -69,16 +73,16 @@ Group by `id`/`event` to join them, e.g.
 
 ## Hook payloads
 
-| Field | Claude Code | Codex | OpenCode plugin |
-| --- | --- | --- | --- |
-| Trigger | `PostToolUseFailure` | `PostToolUse`, all calls | nonzero exit or error state |
-| `tool.input` | `tool_input.command`, else `tool_input` | same; Bash is unwrapped first | tool args |
-| `exit_code` | `Exit code N` in `error` | `exit_code`, `Exit code N`, or wrapper marker | `metadata.exit` |
-| `duration_ms` | `duration_ms` | `duration_ms`, else wrapper start time | timed in plugin |
-| `output_tail` | `error` | `tool_response` | tool output or error |
-| `harness.version` | `AI_AGENT` | `CODEX_VERSION`, else `codex --version` | `opencode --version` |
-| `harness.model` | transcript tail | `model` | `chat.params` |
-| `harness.agent` | `agent_type` (subagents) | none | `chat.params` agent |
+| Field | Claude Code | Codex | OpenCode 2.x | OpenCode 1.x |
+| --- | --- | --- | --- | --- |
+| Trigger | `PostToolUseFailure` | `PostToolUse`, all calls | `tool.hook("execute.after")`, nonzero exit or error | `tool.execute.after` and error events |
+| `tool.input` | `tool_input.command`, else `tool_input` | same; Bash is unwrapped first | `input` | tool args |
+| `exit_code` | `Exit code N` in `error` | `exit_code`, `Exit code N`, or wrapper marker | `result.output.exit` | `metadata.exit` |
+| `duration_ms` | `duration_ms` | `duration_ms`, else wrapper start time | timed in plugin | timed in plugin |
+| `output_tail` | `error` | `tool_response` | `result.output.output` or `error.message` | tool output or error |
+| `harness.version` | `AI_AGENT` | `CODEX_VERSION`, else `codex --version` | `app.version` | `opencode --version` |
+| `harness.model` | transcript tail | `model` | `session.get` | `chat.params` |
+| `harness.agent` | `agent_type` (subagents) | none | `agent` | `chat.params` agent |
 
 Codex Bash commands are wrapped by a `PreToolUse` hook so the exit status and
 start time are recoverable from the result. That duration spans both hooks, so
@@ -114,8 +118,9 @@ OpenCode plugin at that path.
 Hooks fail open: any error prints one line without payload content and exits
 nonzero, which harnesses treat as non-blocking. Metadata probes (git,
 Tailscale, versions) run in parallel under a two second deadline. Detection is
-best effort. Interruptions are ignored. OpenCode adds reminders to completed
-nonzero tool results; its other error path uses an experimental prompt hook. A
+best effort. Interruptions are ignored. OpenCode 2.x appends reminders to the
+tool result or error message. OpenCode 1.x appends them to completed nonzero
+results, and its other error path uses an experimental prompt hook. A
 crash between append and deduplication can leave a duplicate record.
 
 Earlier versions wrote `friction.md`. It is left in place and no longer
