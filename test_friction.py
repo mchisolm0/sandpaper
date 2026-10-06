@@ -83,6 +83,16 @@ class RedactionTest(unittest.TestCase):
         self.assertNotIn("hunter2", redacted)
         self.assertNotIn("localpass1", redacted)
 
+    def test_container_values_propagate_and_known_secrets_stay_whole(self):
+        _, output = friction.clip_fields([('{"credentials":{"password":"localpass1"}}', 200, False),
+                                          ("login failed using localpass1", 200, True)])
+        self.assertNotIn("localpass1", output)
+        command, output = friction.clip_fields([('login password="correct horse battery staple"', 200, False),
+                                                ("echo correct horse battery staple", 200, True)])
+        self.assertNotIn("horse", command + output)
+        with mock.patch.dict(os.environ, {"SERVICE_PASSWORD": "alpha,beta;gamma"}):
+            self.assertNotIn("beta", friction.redact("password=alpha,beta;gamma"))
+
     def test_secret_on_dropped_long_line_is_still_redacted_elsewhere(self):
         text = '{"password":"hunter2","pad":"' + "x" * 5000 + '"}\nlogin failed for hunter2'
         clipped = friction.clip(text, 2000, tail=True)

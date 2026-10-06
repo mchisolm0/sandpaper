@@ -89,7 +89,10 @@ _CONTAINER = re.compile(rf"(?i){_START}{_NAME}\\?[\"']?\s*[:=]\s*(?=[\[{{])")
 
 def harvestable(value):
     # Long values, or short ones that are not plain words like true/none, are worth redacting everywhere.
-    return (len(value) >= 8 or (len(value) >= 5 and not value.isalpha())) and len(value) <= MAX_SECRET_LENGTH
+    # Bare label words (credentials, api_key) are skipped so literal replacement never hides a label.
+    label = re.fullmatch(r"[A-Za-z_.-]+", value) and re.fullmatch(_NAME, value, re.I)
+    return (len(value) >= 8 or (len(value) >= 5 and not value.isalpha())) and len(value) <= MAX_SECRET_LENGTH \
+        and not label
 
 
 def harvest(value, found):
@@ -127,9 +130,11 @@ def redact_containers(text, found):
         if match.start() < position:
             continue
         end = balanced_end(text, match.end())
-        # Values only: a harvested key name ("password") would erase that label elsewhere.
-        for value in re.findall(r'"((?:[^"\\\n]|\\.)*)"(?!\s*:)', text[match.end():end]):
-            harvest(value, found)
+        # Values only: a harvested key name ("password") would erase that label elsewhere. Each match
+        # consumes a whole quoted string, so a rejected key cannot shift matching onto its separator.
+        for string in re.finditer(r'"((?:[^"\\\n]|\\.)*)"(\s*:)?', text[match.end():end]):
+            if not string[2]:
+                harvest(string[1], found)
         parts += [text[position:match.end()], REDACTED]
         position = end
     return "".join(parts) + text[position:]
@@ -153,8 +158,9 @@ def redact(text, found=None):
         # One alternation pass, longest first, rather than one full scan per secret.
         return re.compile("|".join(map(re.escape, sorted(found, key=len, reverse=True)))).sub(REDACTED, text)
 
-    # Labeled rules run first; the literal pass comes last so it can never erase a label they rely on.
-    text = redact_containers(text, found)
+    # Known secrets go first, whole, before label rules can split them (password=a,b;c); and again last
+    # for anything harvested meanwhile. Label-like words are never harvested, so neither pass erases labels.
+    text = replace_known(redact_containers(text, found))
     for pattern, harvested in REDACTIONS:
         def replace(match):
             if harvested:
