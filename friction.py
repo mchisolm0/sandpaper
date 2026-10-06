@@ -573,29 +573,24 @@ def edit_hooks(agent, action):
     return all(present)
 
 
-def opencode_plugins():
-    """Rendered plugin sources as (for the installed OpenCode, for the other major version)."""
+def edit_opencode(action):
+    target = Path.home() / ".config/opencode/plugins/friction.ts"
     script = json.dumps(str(Path(__file__).resolve()))
-    v1, v2 = (Path(__file__).with_name(name).read_text().replace("__FRICTION_SCRIPT__", script)
-              for name in ("opencode-friction.ts", "opencode-friction-v2.ts"))
     # OpenCode 2 only loads plugins with a default {id, setup} export; 1.x expects named hook factories.
     version = run_probes({"opencode": ["opencode", "--version"]}, None).get("opencode", "")
     major = re.search(r"(\d+)\.\d+", version)
-    return (v1, v2) if major and int(major[1]) < 2 else (v2, v1)
-
-
-def edit_opencode(action):
-    target = Path.home() / ".config/opencode/plugins/friction.ts"
-    content, other = opencode_plugins()
+    template = "opencode-friction.ts" if major and int(major[1]) < 2 else "opencode-friction-v2.ts"
+    content = Path(__file__).with_name(template).read_text().replace("__FRICTION_SCRIPT__", script)
     existing = target.read_text() if target.exists() else None
     installed = existing == content
+    # Any plugin that calls this script is ours to replace or remove, whatever template or version wrote it.
+    ours = existing is not None and script in existing
     if action == "install" and not installed:
-        # Replace our own plugin for the other OpenCode version, but never someone else's file.
-        if (existing is not None and existing != other) or (existing is None and target.is_symlink()):
+        if (existing is not None and not ours) or (existing is None and target.is_symlink()):
             raise ValueError(f"existing plugin differs: {target}")
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content)
-    elif action == "uninstall" and existing in (content, other):
+    elif action == "uninstall" and ours:
         target.unlink()
         return True
     return installed

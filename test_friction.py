@@ -104,6 +104,9 @@ class HookTest(unittest.TestCase):
             fake.chmod(0o755)
             self.run_script("install", "opencode")
             self.assertIn(marker, plugin.read_text())
+        plugin.write_text(plugin.read_text().replace("Date.now()", "Date.now() /* older template */"))
+        self.run_script("install", "opencode")
+        self.assertNotIn("older template", plugin.read_text())
         plugin.write_text("// someone else's plugin\n")
         self.assertNotEqual(self.run_script("install", "opencode", check=False).returncode, 0)
 
