@@ -52,7 +52,8 @@ Every record has `schema` (currently `1`) and `kind`. An `event` looks like:
 
 - `source` is `hook` or `manual`. Manual events have `tool: null`.
 - `signal` is `low` for exit 1 from a trailing `rg`, `grep`, `diff`, `cmp`, or
-  `test`. In a compound command it is low only when nothing was printed. Low
+  `test`. With pipes, `&&`, or redirections it is low only when nothing was
+  printed. Negated commands (`! grep`) are never low. Low
   events are recorded without prompting the agent or probing tool versions.
 - `category` is `exit-N`, `tool-error`, `timeout`, `permission-denied`,
   `authentication`, `rate-limit`, `missing-file`, `patch-mismatch`, or `manual`.
@@ -92,21 +93,28 @@ effort.
 
 ## Redaction
 
-Tool input, output, the working directory, and notes are redacted before they
-are written, then truncated to 2000 characters (output keeps the tail). Rules:
+Tool input, output, the working directory, tool names, branch, model, agent,
+and notes are redacted before they are written, then truncated to 2000
+characters (output keeps the tail). Rules:
 
-- Private key blocks, `Authorization`/`Cookie`/`X-*-Key` header values,
-  credentials in URLs, and bearer tokens.
+- Private key blocks, `Authorization`/`Cookie`/`X-*-Key` header values (also
+  as JSON keys), credentials in URLs, and bearer tokens.
 - Known token formats: GitHub, OpenAI and Anthropic, Slack, AWS, Google,
   GitLab, npm, Stripe, Hugging Face, Tailscale, and JWTs.
 - Values after secret-looking names: `API_KEY=x`, `--token x`,
-  `"password": "x"`, `?access_token=x`.
+  `"password": "x"` (escape aware), `"keys": [...]`, `?access_token=x`.
 - Every shell env assignment value: `FOO=bar cmd`, `export foo=bar`.
 - Opaque runs of 32+ characters that mix upper case, lower case, and digits.
   Hex hashes and UUIDs are kept.
-- Values of secret-named environment variables in the hook's environment, and
-  secrets found in the tool input, are also replaced wherever they appear in
-  the output.
+- Structured tool input is redacted before it is serialized: any key with a
+  secret-looking or header name has its whole value replaced.
+- Secrets found in one field (the input, the output, or any note field) are
+  replaced wherever they appear in the related fields, as are values of
+  secret-named environment variables. Short values count when they are not
+  plain words, so `password=hunter2` hides a later `hunter2`.
+
+Redaction scans at most 256 KB of a field, cut at a line boundary so no value
+is separated from its label. A single line longer than that is omitted.
 
 ## Behavior
 
@@ -117,7 +125,8 @@ OpenCode plugin at that path.
 
 Hooks fail open: any error prints one line without payload content and exits
 nonzero, which harnesses treat as non-blocking. Metadata probes (git,
-Tailscale, versions) run in parallel under a two second deadline. Detection is
+Tailscale, versions) run in parallel under a two second deadline, and a write
+that waits more than two seconds for the SQLite lock is dropped. Detection is
 best effort. Interruptions are ignored. OpenCode 2.x appends reminders to the
 tool result or error message. OpenCode 1.x appends them to completed nonzero
 results, and its other error path uses an experimental prompt hook. A

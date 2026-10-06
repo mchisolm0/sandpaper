@@ -1,3 +1,4 @@
+// Installed by sandpaper friction.py; install and uninstall manage this file.
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
@@ -38,10 +39,16 @@ export default {
       const start = started.get(call.id);
       started.delete(call.id);
       try {
-        const session = await ctx.session.get({ sessionID: call.sessionID }).catch(() => undefined);
+        // Model metadata is optional; never let a stalled lookup hold up the tool call.
+        const session = await Promise.race([
+          ctx.session.get({ sessionID: call.sessionID }).catch(() => undefined),
+          new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 1_000)),
+        ]);
         const process = run("python3", [__FRICTION_SCRIPT__, "opencode"], {
           cwd: ctx.location.directory, timeout: 40_000,
         });
+        // Without a listener, EPIPE from an early-exiting recorder crashes OpenCode.
+        process.child.stdin?.on("error", () => {});
         process.child.stdin?.end(JSON.stringify({
           hook_event_name: "PostToolUse", session_id: call.sessionID, tool_use_id: call.id,
           cwd: ctx.location.directory, tool_name: call.tool, tool_input: call.input, tool_response: response,

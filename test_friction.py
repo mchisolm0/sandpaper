@@ -33,6 +33,10 @@ class RedactionTest(unittest.TestCase):
             "opaque blob": ("key 7fQpZ2mLx9RtV4sKcN8bJ3hW6yE1aU5o", "7fQpZ2mLx9"),
             "private key": ("-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXk\n-----END OPENSSH PRIVATE KEY-----", "b3Blbn"),
             "truncated private key": ("-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA", "MIIEow"),
+            "json basic auth": ('{"Authorization": "Basic dXNlcjpwYXNzd29yZA=="}', "dXNlcjpw"),
+            "escaped quote": ('{"password": "pa\\"ss-tail"}', "ss-tail"),
+            "secret array": ('{"api_keys": ["first-key-1", "second-key-2"]}', "second-key"),
+            "token after underscore": ("mcp__apikey_ghp_abcdefghijklmnopqrstuvwx", "ghp_"),
         }
         for name, (text, secret) in cases.items():
             with self.subTest(name):
@@ -50,9 +54,23 @@ class RedactionTest(unittest.TestCase):
             "error: cannot find module '/Users/mcc/code/Project2/src/components/Thing'",
             "ls: cannot access '/nonexistent': No such file or directory",
             "ssh git@github.com",
+            '{"author": "Matt", "count": 12}',
         ):
             with self.subTest(text):
                 self.assertEqual(friction.redact(text), text)
+
+    def test_secrets_propagate_across_related_fields(self):
+        command, output = friction.clip_fields([("login password=hunter2", 200, False),
+                                                ("failed using hunter2, retried hunter2", 200, True)])
+        self.assertNotIn("hunter2", command + output)
+        found = set()
+        self.assertEqual(friction.redact_value({"token": ["aaa-111-bbb"], "ok": ["x"]}, found),
+                         {"token": "[REDACTED]", "ok": ["x"]})
+        self.assertIn("aaa-111-bbb", found)
+
+    def test_line_longer_than_redaction_window_is_omitted(self):
+        text = "Authorization: Bearer " + "x" * friction.REDACT_WINDOW
+        self.assertIn("omitted", friction.clip(text, 100, tail=True))
 
     def test_clip_redacts_before_truncating(self):
         text = "x" * 5000 + "\nAuthorization: Bearer abcdefghijkl\nfailed"
@@ -60,6 +78,22 @@ class RedactionTest(unittest.TestCase):
         self.assertTrue(clipped.startswith("["))
         self.assertTrue(clipped.endswith("failed"))
         self.assertNotIn("abcdefghijkl", clipped)
+
+
+class ClassificationTest(unittest.TestCase):
+    def test_low_signal(self):
+        for command, output, expected in (
+            ("rg -n needle src", "", True),
+            ("grep needle file", "", True),
+            ("cd src && rg needle", "", True),
+            ("cd missing && rg needle", "cd: no such file", False),
+            ("rg needle 2>/dev/null", "", True),
+            ("grep needle < /missing", "bash: /missing: No such file or directory", False),
+            ("! grep -q needle file", "", False),
+            ("pnpm test", "", False),
+        ):
+            with self.subTest(command):
+                self.assertEqual(friction.low_signal(command, 1, output), expected)
 
 
 class HookTest(unittest.TestCase):
@@ -107,7 +141,7 @@ class HookTest(unittest.TestCase):
         plugin.write_text(plugin.read_text().replace("Date.now()", "Date.now() /* older template */"))
         self.run_script("install", "opencode")
         self.assertNotIn("older template", plugin.read_text())
-        plugin.write_text("// someone else's plugin\n")
+        plugin.write_text(f"// calls {SCRIPT.resolve()} too, but is someone else's plugin\n")
         self.assertNotEqual(self.run_script("install", "opencode", check=False).returncode, 0)
 
     def test_failure_event_then_linked_note(self):

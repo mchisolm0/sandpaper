@@ -31,27 +31,37 @@ VERSIONED_TOOLS = {"git", "gh", "rg", "grep", "jq", "make", "node", "bun", "deno
                    "python", "python3", "uv", "pip", "cargo", "rustc", "docker", "tsc", "mise", "curl"}
 HARNESSES = {"claude": "claude-code", "codex": "codex", "opencode": "opencode"}
 HARNESS_BINARIES = {"claude-code": "claude", "codex": "codex", "opencode": "opencode"}
+# First line of both OpenCode plugin templates; install and uninstall only touch files that carry it.
+OPENCODE_MARKER = "// Installed by sandpaper friction.py; install and uninstall manage this file."
+# sha256 of the unmarked OpenCode plugin template from the first release, so upgrades can replace it.
+LEGACY_OPENCODE_SHA256 = "8f1810c45d1e17bb4711be09a15fd59b3a5eb9641abdce74d7a0f9b85664b0fe"
 
 REDACTED = "[REDACTED]"
+# Redaction sees at most this much of one field, cut at a line boundary so no value loses its label.
+REDACT_WINDOW = 262_144
 # Names that mark the next value as secret: API_KEY=..., --token ..., "password": ...
 _NAME = (r"[\w.-]{0,80}?(?:secret|token|passw(?:or)?d|pwd|api[_-]?key|access[_-]?key|private[_-]?key"
-         r"|credentials?|auth(?!or)|cookie|session[_-]?key|signature)[\w.-]{0,80}")
+         r"|credentials?|auth(?!ors?\b)|cookie|session[_-]?key|signature)[\w.-]{0,80}")
+_HEADER = r"(?:proxy-)?authorization|x-[a-z-]*(?:key|token)|api-key|(?:set-)?cookie"
 # Anchors name matching to word starts, which keeps long unbroken runs fast.
 _START = r"(?<![\w.-])"
-# Skips values an earlier rule already replaced.
-_VALUE = r"(?!\[REDACTED)(?:\"[^\"\n]*\"|'[^'\n]*'|[^\s\"'&;|,)}\]]+)"
+# A quoted string (escape aware, including \"...\" inside JSON text), a bracketed list, or a bare word.
+# The lookahead skips values an earlier rule already replaced.
+_VALUE = (r"(?!\[REDACTED)(?:\"(?:[^\"\\\n]|\\.)*\"|'(?:[^'\\\n]|\\.)*'|\\\"[^\"\n]*?\\\"|\[[^\]\n]*\]"
+          r"|[^\s\"'&;|,)}\]]+)")
 _BLOB = r"A-Za-z0-9+_-"
-# Each rule replaces its `s` group. Values from rules marked True are also redacted literally in later
+# Each rule replaces its `s` group. Values from rules marked True are also redacted literally in related
 # text, so a secret labeled in a command (API_KEY=x) is caught when the output echoes it unlabeled.
 REDACTIONS = [(re.compile(pattern), harvest) for pattern, harvest in (
     (r"(?s)(?P<s>-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z))", False),
-    (r"(?i)\b(?:(?:proxy-)?authorization|x-[a-z-]*(?:key|token)|api-key|(?:set-)?cookie)\s*:\s*(?P<s>[^\"'\n]+)", True),
+    (rf"(?i)\b(?:{_HEADER})\\?[\"']?\s*:\s*\\?[\"']?(?P<s>[^\"'\\\n]+)", True),
     (r"(?i)\b[a-z][a-z0-9+.-]*://(?P<s>[^/\s:@\"']+:[^/\s@\"']*)@", True),
     (r"(?i)\bbearer\s+(?P<s>[\w.~+/=-]{8,})", True),
-    (r"(?P<s>\b(?:gh[pousr]_\w{20,}|github_pat_\w{20,}|sk-[\w-]{20,}|xox[abeoprs]-[\w-]{10,}|(?:AKIA|ASIA)[0-9A-Z]{16}"
-     r"|AIza[\w-]{30,}|glpat-[\w-]{20,}|npm_\w{30,}|[sr]k_live_\w{16,}|hf_\w{30,}|tskey-[\w-]{16,}"
-     r"|eyJ[\w-]{8,}\.[\w-]{8,}\.[\w-]{8,}))", True),
-    (rf"(?i){_START}{_NAME}[\"']?\s*[:=]\s*(?P<s>{_VALUE})", True),
+    # Known token formats. The lookbehind allows a preceding underscore, as in mcp__x_ghp_....
+    (r"(?<![A-Za-z0-9])(?P<s>(?:gh[pousr]_\w{20,}|github_pat_\w{20,}|sk-[\w-]{20,}|xox[abeoprs]-[\w-]{10,}"
+     r"|(?:AKIA|ASIA)[0-9A-Z]{16}|AIza[\w-]{30,}|glpat-[\w-]{20,}|npm_\w{30,}|[sr]k_live_\w{16,}|hf_\w{30,}"
+     r"|tskey-[\w-]{16,}|eyJ[\w-]{8,}\.[\w-]{8,}\.[\w-]{8,}))", True),
+    (rf"(?i){_START}{_NAME}\\?[\"']?\s*[:=]\s*(?P<s>{_VALUE})", True),
     (rf"(?i){_START}--?{_NAME}\s+(?P<s>{_VALUE})", True),
     # Every shell env assignment, secret-looking name or not: FOO=bar cmd, export foo=bar. Not harvested,
     # since values like NODE_ENV=test are common words.
@@ -62,36 +72,103 @@ REDACTIONS = [(re.compile(pattern), harvest) for pattern, harvest in (
 )]
 
 
+# Cap on secrets reused across fields; past it, labeled values are still redacted where they appear.
+MAX_SECRETS = 64
+
+
+def harvestable(value):
+    # Long values, or short ones that are not plain words like true/none, are worth redacting everywhere.
+    return len(value) >= 8 or (len(value) >= 5 and not value.isalpha())
+
+
 def redact(text, found=None):
     """Redact secrets in text. found: optional set that collects secret values to reuse on related text."""
     found = set() if found is None else found
     # Literal values of secret-named env vars catch tokens echoed in output in any format.
     found.update(value for name, value in os.environ.items()
                  if len(value) >= 8 and not value.startswith("/") and re.fullmatch(_NAME, name, re.I))
-    for value in sorted(found, key=len, reverse=True):
-        text = text.replace(value, REDACTED)
 
+    def replace_known(text):
+        if not found:
+            return text
+        # One alternation pass, longest first, rather than one full scan per secret.
+        return re.compile("|".join(map(re.escape, sorted(found, key=len, reverse=True)))).sub(REDACTED, text)
+
+    text = replace_known(text)
     for pattern, harvest in REDACTIONS:
         def replace(match):
-            value = match["s"].strip("\"'")
-            if harvest and len(value) >= 8:
+            value = match["s"].strip("\\\"'")
+            if harvest and harvestable(value) and len(found) < MAX_SECRETS:
                 found.add(value)
             whole, start = match[0], match.start()
             return whole[:match.start("s") - start] + REDACTED + whole[match.end("s") - start:]
         text = pattern.sub(replace, text)
-    return text
+    # Secrets harvested above may also appear unlabeled elsewhere in this text.
+    return replace_known(text)
+
+
+def redact_value(value, found):
+    """Redact a JSON-like tool input before it is serialized, so nesting and quoting cannot hide secrets."""
+    if isinstance(value, dict):
+        redacted = {}
+        for key, item in value.items():
+            if isinstance(key, str) and re.fullmatch(f"{_NAME}|{_HEADER}", key, re.I):
+                found.update([leaf for leaf in leaves(item) if harvestable(leaf)][:MAX_SECRETS - len(found)])
+                redacted[key] = REDACTED
+            else:
+                redacted[key] = redact_value(item, found)
+        return redacted
+    if isinstance(value, list):
+        return [redact_value(item, found) for item in value]
+    if isinstance(value, str):
+        # Only the head of the serialized input survives truncation, so long leaves need not be scanned whole.
+        return redact(window(value, INPUT_LIMIT * 8, tail=False), found)
+    return value
+
+
+def leaves(value):
+    if isinstance(value, dict):
+        return [leaf for item in value.values() for leaf in leaves(item)]
+    if isinstance(value, list):
+        return [leaf for item in value for leaf in leaves(item)]
+    return [value] if isinstance(value, str) else []
+
+
+def window(text, size, tail):
+    """At most size chars from one end of text, cut at a line boundary; "" when one line is longer."""
+    if len(text) <= size:
+        return text
+    part = text[-size:] if tail else text[:size]
+    cut = part.find("\n") if tail else part.rfind("\n")
+    if cut < 0:
+        return ""
+    return part[cut + 1:] if tail else part[:cut]
 
 
 def clip(text, limit, tail=False, found=None):
     """Redact, then truncate to limit characters. tail keeps the end, where errors usually are."""
     if not isinstance(text, str) or not text.strip():
         return None
-    # Redact a bounded window so huge outputs stay fast; the cut is far from what survives truncation.
-    text = redact(text[-limit * 8:] if tail else text[:limit * 8], found)
+    visible = window(text, REDACT_WINDOW, tail)
+    if not visible.strip():
+        return f"[{len(text)} chars omitted: too long to redact safely]"
+    text = redact(visible, found)
     if len(text) <= limit:
         return text
     marker = f"[{len(text) - limit} chars truncated]"
     return f"{marker}\n{text[-limit:]}" if tail else f"{text[:limit]}\n{marker}"
+
+
+def clip_fields(fields, found=None):
+    """clip() related (text, limit, tail) fields with one secret set, so a secret found in any is redacted in all."""
+    found = set() if found is None else found
+    for text, limit, tail in fields:
+        clip(text, limit, tail, found)
+    return [clip(text, limit, tail, found) for text, limit, tail in fields]
+
+
+def scrub(value):
+    return redact(value) if isinstance(value, str) else value
 
 
 def object_value(value):
@@ -172,13 +249,19 @@ def response_text(response):
     return json.dumps(response, ensure_ascii=False) if response else None
 
 
-def command_names(command):
-    """argv[0] basenames of each simple command in a shell string, in order; None if it does not parse."""
+def shell_tokens(command):
     try:
         lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
         lexer.whitespace_split = True
-        tokens = list(lexer)
+        return list(lexer)
     except ValueError:
+        return None
+
+
+def command_names(command):
+    """argv[0] basenames of each simple command in a shell string, in order; None if it does not parse."""
+    tokens = shell_tokens(command)
+    if tokens is None:
         return None
     names, start = [], True
     for token in tokens:
@@ -191,14 +274,17 @@ def command_names(command):
 
 
 def low_signal(command, code, output):
-    # Exit 1 from a trailing search or comparison. In a compound command, only trust it when the
-    # command printed nothing, since an earlier step (cd, a build) can also exit 1 with an error.
+    # Exit 1 from a trailing search or comparison. A plain single command is trusted outright. Compound
+    # commands and redirections count only when nothing was printed, since an earlier step or a missing
+    # input file (grep x < /missing) also exits 1 with an error. Negation never counts: `! grep` exiting
+    # 1 means the match was found, so an assertion failed.
     if code != 1 or not isinstance(command, str) or "\n" in command:
         return False
-    names = command_names(command)
-    if not names or names[-1] not in EXPECTED_EXIT_1:
+    tokens, names = shell_tokens(command), command_names(command)
+    if not names or names[-1] not in EXPECTED_EXIT_1 or "!" in tokens:
         return False
-    return len(names) == 1 or not (output or "").strip()
+    plain = len(names) == 1 and not any(token[0] in "<>" for token in tokens)
+    return plain or not (output or "").strip()
 
 
 def categorize(shell, code, message):
@@ -417,14 +503,17 @@ def capture(source, failure):
     launcher = "t3-code" if any(name.startswith("T3CODE_") for name in os.environ) else os.environ.get("TERM_PROGRAM")
     tool = None
     if failure.get("tool"):
-        tool_input = command if shell else json.dumps(command, ensure_ascii=False, sort_keys=True) if command else None
         secrets = set()
+        if not shell and command:
+            command = json.dumps(redact_value(command, secrets), ensure_ascii=False, sort_keys=True)
+        tool_input, output_tail = clip_fields(
+            [(command, INPUT_LIMIT, False), (failure.get("output"), OUTPUT_LIMIT, True)], secrets)
         tool = {
-            "name": failure["tool"],
-            "input": clip(tool_input, INPUT_LIMIT, found=secrets),
+            "name": scrub(failure["tool"]),
+            "input": tool_input,
             "exit_code": failure.get("exit_code"),
             "duration_ms": failure.get("duration_ms"),
-            "output_tail": clip(failure.get("output"), OUTPUT_LIMIT, tail=True, found=secrets),
+            "output_tail": output_tail,
             "versions": {name: versions.get(name) for name in tools},
         }
     return {
@@ -441,15 +530,15 @@ def capture(source, failure):
             "launcher": launcher,
             "session_id": session,
             "turn_id": failure.get("turn_id"),
-            "model": failure.get("model") or transcript_model(failure.get("transcript_path")),
-            "agent": failure.get("agent"),
+            "model": scrub(failure.get("model") or transcript_model(failure.get("transcript_path"))),
+            "agent": scrub(failure.get("agent")),
             "permission_mode": failure.get("permission_mode"),
         },
         "tool": tool,
         "context": {
             "cwd": clip(cwd, INPUT_LIMIT),
-            "repo": repo_name(results.get("remote"), repo[0]) if len(repo) == 3 else None,
-            "branch": repo[2] if len(repo) == 3 else None,
+            "repo": scrub(repo_name(results.get("remote"), repo[0])) if len(repo) == 3 else None,
+            "branch": scrub(repo[2]) if len(repo) == 3 else None,
             "commit": repo[1] if len(repo) == 3 else None,
         },
         "host": {
@@ -464,11 +553,11 @@ def capture(source, failure):
 def note(event_id, expected, actual, noticed):
     if not expected.strip() or not actual.strip():
         raise ValueError("expected and actual must be nonempty")
+    expected, actual, noticed = clip_fields([(text, INPUT_LIMIT, False) for text in (expected, actual, noticed)])
     return {
         "schema": SCHEMA, "kind": "note", "event": event_id,
         "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
-        "expected": clip(expected, INPUT_LIMIT), "actual": clip(actual, INPUT_LIMIT),
-        "noticed": clip(noticed, INPUT_LIMIT),
+        "expected": expected, "actual": actual, "noticed": noticed,
     }
 
 
@@ -485,7 +574,8 @@ def write(records, key=None, event_id=None):
     state = output_dir()
     state.mkdir(parents=True, exist_ok=True, mode=0o700)
     # ponytail: a crash after append can duplicate; use a transactional report store if needed.
-    with sqlite3.connect(state / "friction-hooks.sqlite3", timeout=20) as db:
+    # A short timeout: under contention, dropping one record beats stalling the tool call.
+    with sqlite3.connect(state / "friction-hooks.sqlite3", timeout=2) as db:
         db.execute("CREATE TABLE IF NOT EXISTS reported (id TEXT PRIMARY KEY)")
         db.execute("BEGIN IMMEDIATE")
         if key and db.execute("SELECT 1 FROM reported WHERE id = ?", (key,)).fetchone():
@@ -511,7 +601,7 @@ def record(source, event):
     if not write([captured], key=failure["key"]) or failure["signal"] == "low":
         return None
     return (
-        f"Friction event {captured['id']}: {source} {failure['tool']} {failure['category']}, recorded with "
+        f"Friction event {captured['id']}: {source} {captured['tool']['name']} {failure['category']}, recorded with "
         "the command, output tail, and environment. If this failure was unexpected, attach a note to the "
         f"same event: {script_command()} report --event {captured['id']} --expected TEXT --actual TEXT "
         "--noticed TEXT. Skip it if the failure was expected. Do not paste secrets. Continue the task."
@@ -583,8 +673,10 @@ def edit_opencode(action):
     content = Path(__file__).with_name(template).read_text().replace("__FRICTION_SCRIPT__", script)
     existing = target.read_text() if target.exists() else None
     installed = existing == content
-    # Any plugin that calls this script is ours to replace or remove, whatever template or version wrote it.
-    ours = existing is not None and script in existing
+    # Ours: carries the install marker, or is the unmarked template the first release installed.
+    legacy = existing is not None and hashlib.sha256(
+        existing.replace(script, "__FRICTION_SCRIPT__").encode()).hexdigest() == LEGACY_OPENCODE_SHA256
+    ours = existing is not None and (OPENCODE_MARKER in existing or legacy)
     if action == "install" and not installed:
         if (existing is not None and not ours) or (existing is None and target.is_symlink()):
             raise ValueError(f"existing plugin differs: {target}")

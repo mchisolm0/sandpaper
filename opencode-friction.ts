@@ -1,3 +1,4 @@
+// Installed by sandpaper friction.py; install and uninstall manage this file.
 import type { Plugin } from "@opencode-ai/plugin";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -18,6 +19,8 @@ export const Friction: Plugin = async ({ directory }) => {
       const process = run("python3", [__FRICTION_SCRIPT__, "opencode"], {
         cwd: directory, timeout: 40_000,
       });
+      // Without a listener, EPIPE from an early-exiting recorder crashes OpenCode.
+      process.child.stdin?.on("error", () => {});
       process.child.stdin?.end(JSON.stringify({
         hook_event_name: "PostToolUse", session_id: sessionID, tool_use_id: callID, cwd: directory,
         tool_name: tool, tool_input: input, tool_response: response, duration_ms: durationMs,
