@@ -76,6 +76,19 @@ class RedactionTest(unittest.TestCase):
                                                 ('failed pa"ss-tail', 200, True)])
         self.assertNotIn("ss-tail", command + output)
 
+    def test_secret_key_names_are_not_harvested(self):
+        text = '{"credentials":{"password":"localpass1"},"password":"hunter2"}'
+        redacted = friction.redact(text)
+        self.assertIn('"password":', redacted)
+        self.assertNotIn("hunter2", redacted)
+        self.assertNotIn("localpass1", redacted)
+
+    def test_secret_on_dropped_long_line_is_still_redacted_elsewhere(self):
+        text = '{"password":"hunter2","pad":"' + "x" * 5000 + '"}\nlogin failed for hunter2'
+        clipped = friction.clip(text, 2000, tail=True)
+        self.assertIn("line omitted", clipped)
+        self.assertNotIn("hunter2", clipped)
+
     def test_too_many_secrets_omits_the_field(self):
         command = " ".join(f"token=dummy-secret-{i:03}" for i in range(friction.MAX_SECRETS + 1))
         command, output = friction.clip_fields([(command, 99999, False), ("echo dummy-secret-064", 200, True)])

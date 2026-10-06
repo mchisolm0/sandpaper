@@ -42,6 +42,8 @@ REDACT_WINDOW = 262_144
 # Output lines longer than this are omitted: harnesses truncate big outputs before hooks see them, which can
 # cut a secret's label off its value, and such lines (minified code, blobs) are rarely diagnostic anyway.
 MAX_OUTPUT_LINE = 4096
+# Anchored to line starts so short lines are not rescanned from every offset.
+LONG_LINE = re.compile(rf"(?m)^[^\n]{{{MAX_OUTPUT_LINE + 1},}}")
 # Names that mark the next value as secret: API_KEY=..., --token ..., "password": ...
 _NAME = (r"[\w.-]{0,80}?(?:secret|token|passw(?:or)?d|pwd|api[_-]?key|access[_-]?key|private[_-]?key"
          r"|credentials?|auth(?!ors?\b)|cookie|session[_-]?key|signature)[\w.-]{0,80}")
@@ -125,7 +127,8 @@ def redact_containers(text, found):
         if match.start() < position:
             continue
         end = balanced_end(text, match.end())
-        for value in re.findall(r'"((?:[^"\\\n]|\\.)*)"', text[match.end():end]):
+        # Values only: a harvested key name ("password") would erase that label elsewhere.
+        for value in re.findall(r'"((?:[^"\\\n]|\\.)*)"(?!\s*:)', text[match.end():end]):
             harvest(value, found)
         parts += [text[position:match.end()], REDACTED]
         position = end
@@ -150,7 +153,8 @@ def redact(text, found=None):
         # One alternation pass, longest first, rather than one full scan per secret.
         return re.compile("|".join(map(re.escape, sorted(found, key=len, reverse=True)))).sub(REDACTED, text)
 
-    text = replace_known(redact_containers(text, found))
+    # Labeled rules run first; the literal pass comes last so it can never erase a label they rely on.
+    text = redact_containers(text, found)
     for pattern, harvested in REDACTIONS:
         def replace(match):
             if harvested:
@@ -158,7 +162,7 @@ def redact(text, found=None):
             whole, start = match[0], match.start()
             return whole[:match.start("s") - start] + REDACTED + whole[match.end("s") - start:]
         text = pattern.sub(replace, text)
-    # Secrets harvested above may also appear unlabeled elsewhere in this text.
+    # Known secrets (env, related fields, harvested above) may also appear unlabeled in this text.
     return replace_known(text)
 
 
@@ -208,12 +212,13 @@ def clip(text, limit, tail=False, found=None):
     visible = window(text, REDACT_WINDOW, tail)
     if not visible.strip():
         return f"[{len(text)} chars omitted: too long to redact safely]"
-    if tail:
-        visible = re.sub(rf"[^\n]{{{MAX_OUTPUT_LINE + 1},}}", lambda line: f"[{len(line[0])}-char line omitted]", visible)
     found = set() if found is None else found
+    # Redact before dropping long lines so secrets labeled on them still reach related text.
     text = redact(visible, found)
     if len(found) > MAX_SECRETS:
         return f"[{len(text)} chars omitted: more than {MAX_SECRETS} secrets to redact safely]"
+    if tail:
+        text = LONG_LINE.sub(lambda line: f"[{len(line[0])}-char line omitted]", text)
     if len(text) <= limit:
         return text
     marker = f"[{len(text) - limit} chars truncated]"
