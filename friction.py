@@ -39,6 +39,9 @@ LEGACY_OPENCODE_SHA256 = "8f1810c45d1e17bb4711be09a15fd59b3a5eb9641abdce74d7a0f9
 REDACTED = "[REDACTED]"
 # Redaction sees at most this much of one field, cut at a line boundary so no value loses its label.
 REDACT_WINDOW = 262_144
+# Output lines longer than this are omitted: harnesses truncate big outputs before hooks see them, which can
+# cut a secret's label off its value, and such lines (minified code, blobs) are rarely diagnostic anyway.
+MAX_OUTPUT_LINE = 4096
 # Names that mark the next value as secret: API_KEY=..., --token ..., "password": ...
 _NAME = (r"[\w.-]{0,80}?(?:secret|token|passw(?:or)?d|pwd|api[_-]?key|access[_-]?key|private[_-]?key"
          r"|credentials?|auth(?!ors?\b)|cookie|session[_-]?key|signature)[\w.-]{0,80}")
@@ -54,6 +57,8 @@ _BLOB = r"A-Za-z0-9+_-"
 # text, so a secret labeled in a command (API_KEY=x) is caught when the output echoes it unlabeled.
 REDACTIONS = [(re.compile(pattern), harvest) for pattern, harvest in (
     (r"(?s)(?P<s>-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z))", False),
+    # A key body whose BEGIN line fell before the redaction window.
+    (r"(?s)\A(?P<s>(?:(?!-----BEGIN ).)*?-----END [A-Z ]*PRIVATE KEY-----)", False),
     (rf"(?i)\b(?:{_HEADER})\\?[\"']?\s*:\s*\\?[\"']?(?P<s>[^\"'\\\n]+)", True),
     (r"(?i)\b[a-z][a-z0-9+.-]*://(?P<s>[^/\s:@\"']+:[^/\s@\"']*)@", True),
     (r"(?i)\bbearer\s+(?P<s>[\w.~+/=-]{8,})", True),
@@ -72,34 +77,84 @@ REDACTIONS = [(re.compile(pattern), harvest) for pattern, harvest in (
 )]
 
 
-# Cap on secrets reused across fields; past it, labeled values are still redacted where they appear.
+# More secrets than this in related fields means the field is omitted rather than partly redacted.
 MAX_SECRETS = 64
+# Longer values are not reused literally; they would make the replacement regex itself the bottleneck.
+MAX_SECRET_LENGTH = 1024
+# A secret-named key whose value is a JSON array or object: {"tokens": [...]} or "credentials": {...}.
+_CONTAINER = re.compile(rf"(?i){_START}{_NAME}\\?[\"']?\s*[:=]\s*(?=[\[{{])")
 
 
 def harvestable(value):
     # Long values, or short ones that are not plain words like true/none, are worth redacting everywhere.
-    return len(value) >= 8 or (len(value) >= 5 and not value.isalpha())
+    return (len(value) >= 8 or (len(value) >= 5 and not value.isalpha())) and len(value) <= MAX_SECRET_LENGTH
+
+
+def harvest(value, found):
+    if harvestable(value):
+        # Keep both spellings: an escaped input value (pa\"ss) is often echoed decoded (pa"ss).
+        found.update({value, re.sub(r"\\(.)", r"\1", value)})
+
+
+def balanced_end(text, start):
+    """Index just past the bracket that closes the one at text[start], ignoring brackets in strings."""
+    depth, quoted, index = 0, False, start
+    while index < len(text):
+        char = text[index]
+        if quoted:
+            if char == "\\":
+                index += 1
+            elif char == '"':
+                quoted = False
+        elif char == '"':
+            quoted = True
+        elif char in "[{":
+            depth += 1
+        elif char in "]}":
+            depth -= 1
+            if depth == 0:
+                return index + 1
+        index += 1
+    return len(text)
+
+
+def redact_containers(text, found):
+    """Replace whole bracketed values after secret-named keys, across nesting and newlines."""
+    parts, position = [], 0
+    for match in _CONTAINER.finditer(text):
+        if match.start() < position:
+            continue
+        end = balanced_end(text, match.end())
+        for value in re.findall(r'"((?:[^"\\\n]|\\.)*)"', text[match.end():end]):
+            harvest(value, found)
+        parts += [text[position:match.end()], REDACTED]
+        position = end
+    return "".join(parts) + text[position:]
 
 
 def redact(text, found=None):
-    """Redact secrets in text. found: optional set that collects secret values to reuse on related text."""
+    """Redact secrets in text. found: optional set that collects secret values to reuse on related text.
+
+    Callers that share found should check len(found) > MAX_SECRETS and omit the text, since known
+    secrets are no longer replaced literally past that point.
+    """
     found = set() if found is None else found
     # Literal values of secret-named env vars catch tokens echoed in output in any format.
     found.update(value for name, value in os.environ.items()
-                 if len(value) >= 8 and not value.startswith("/") and re.fullmatch(_NAME, name, re.I))
+                 if 8 <= len(value) <= MAX_SECRET_LENGTH and not value.startswith("/")
+                 and re.fullmatch(_NAME, name, re.I))
 
     def replace_known(text):
-        if not found:
+        if not found or len(found) > MAX_SECRETS:
             return text
         # One alternation pass, longest first, rather than one full scan per secret.
         return re.compile("|".join(map(re.escape, sorted(found, key=len, reverse=True)))).sub(REDACTED, text)
 
-    text = replace_known(text)
-    for pattern, harvest in REDACTIONS:
+    text = replace_known(redact_containers(text, found))
+    for pattern, harvested in REDACTIONS:
         def replace(match):
-            value = match["s"].strip("\\\"'")
-            if harvest and harvestable(value) and len(found) < MAX_SECRETS:
-                found.add(value)
+            if harvested:
+                harvest(match["s"].strip("\\\"'"), found)
             whole, start = match[0], match.start()
             return whole[:match.start("s") - start] + REDACTED + whole[match.end("s") - start:]
         text = pattern.sub(replace, text)
@@ -113,7 +168,8 @@ def redact_value(value, found):
         redacted = {}
         for key, item in value.items():
             if isinstance(key, str) and re.fullmatch(f"{_NAME}|{_HEADER}", key, re.I):
-                found.update([leaf for leaf in leaves(item) if harvestable(leaf)][:MAX_SECRETS - len(found)])
+                for leaf in leaves(item):
+                    harvest(leaf, found)
                 redacted[key] = REDACTED
             else:
                 redacted[key] = redact_value(item, found)
@@ -152,7 +208,12 @@ def clip(text, limit, tail=False, found=None):
     visible = window(text, REDACT_WINDOW, tail)
     if not visible.strip():
         return f"[{len(text)} chars omitted: too long to redact safely]"
+    if tail:
+        visible = re.sub(rf"[^\n]{{{MAX_OUTPUT_LINE + 1},}}", lambda line: f"[{len(line[0])}-char line omitted]", visible)
+    found = set() if found is None else found
     text = redact(visible, found)
+    if len(found) > MAX_SECRETS:
+        return f"[{len(text)} chars omitted: more than {MAX_SECRETS} secrets to redact safely]"
     if len(text) <= limit:
         return text
     marker = f"[{len(text) - limit} chars truncated]"
@@ -283,7 +344,7 @@ def low_signal(command, code, output):
     tokens, names = shell_tokens(command), command_names(command)
     if not names or names[-1] not in EXPECTED_EXIT_1 or "!" in tokens:
         return False
-    plain = len(names) == 1 and not any(token[0] in "<>" for token in tokens)
+    plain = len(names) == 1 and not any(token.startswith(("<", ">")) for token in tokens)
     return plain or not (output or "").strip()
 
 

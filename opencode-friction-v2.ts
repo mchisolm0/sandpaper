@@ -3,8 +3,6 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
 const run = promisify(execFile);
-// friction.py redacts and keeps only a short tail; this just bounds the stdin payload.
-const OUTPUT_TAIL = 65_536;
 
 // OpenCode 2 passes a richer plugin context than @opencode-ai/plugin publishes types for (checked
 // against 2.0.23), so this declares only the parts used here.
@@ -78,7 +76,7 @@ export default {
       }
       // OpenCode reports empty output as a placeholder; friction.py treats empty output as a signal.
       const output = call.result.output?.output === "(no output)" ? "" : call.result.output?.output ?? "";
-      const reminder = await record(call, { exit_code: exit, output: output.slice(-OUTPUT_TAIL) });
+      const reminder = await record(call, { exit_code: exit, output });
       if (reminder) call.result.content.push({ type: "text", text: reminder });
     });
   },

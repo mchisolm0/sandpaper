@@ -102,7 +102,9 @@ characters (output keeps the tail). Rules:
 - Known token formats: GitHub, OpenAI and Anthropic, Slack, AWS, Google,
   GitLab, npm, Stripe, Hugging Face, Tailscale, and JWTs.
 - Values after secret-looking names: `API_KEY=x`, `--token x`,
-  `"password": "x"` (escape aware), `"keys": [...]`, `?access_token=x`.
+  `"password": "x"` (escape aware), `?access_token=x`. When the value is a
+  JSON array or object, the whole bracketed span is replaced, across nesting
+  and lines.
 - Every shell env assignment value: `FOO=bar cmd`, `export foo=bar`.
 - Opaque runs of 32+ characters that mix upper case, lower case, and digits.
   Hex hashes and UUIDs are kept.
@@ -114,7 +116,10 @@ characters (output keeps the tail). Rules:
   plain words, so `password=hunter2` hides a later `hunter2`.
 
 Redaction scans at most 256 KB of a field, cut at a line boundary so no value
-is separated from its label. A single line longer than that is omitted.
+is separated from its label. Output lines longer than 4 KB are omitted, since
+harnesses truncate large outputs before hooks see them and that cut can drop a
+label. If related fields hold more than 64 distinct secrets, the field is
+omitted rather than partly redacted.
 
 ## Behavior
 

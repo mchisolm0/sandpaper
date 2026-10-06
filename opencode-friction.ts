@@ -4,8 +4,6 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
 const run = promisify(execFile);
-// friction.py redacts and keeps only a short tail; this just bounds the stdin payload.
-const OUTPUT_TAIL = 65_536;
 
 type Call = { sessionID: string; callID: string; tool: string; input: unknown; response: unknown; durationMs?: number };
 
@@ -47,7 +45,7 @@ export const Friction: Plugin = async ({ directory }) => {
       if (typeof exitCode !== "number" || exitCode === 0 || output.metadata?.interrupted === true) return;
       const reminder = await record({
         sessionID, callID, tool, input: args,
-        response: { exit_code: exitCode, output: output.output.slice(-OUTPUT_TAIL) },
+        response: { exit_code: exitCode, output: output.output },
         durationMs: start === undefined ? undefined : Date.now() - start,
       });
       if (reminder) output.output += `\n${reminder}`;

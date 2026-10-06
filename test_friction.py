@@ -37,6 +37,9 @@ class RedactionTest(unittest.TestCase):
             "escaped quote": ('{"password": "pa\\"ss-tail"}', "ss-tail"),
             "secret array": ('{"api_keys": ["first-key-1", "second-key-2"]}', "second-key"),
             "token after underscore": ("mcp__apikey_ghp_abcdefghijklmnopqrstuvwx", "ghp_"),
+            "nested secret list": ('{"tokens": [["first-secret"], ["second-secret"]]}', "second-secret"),
+            "secret object across lines": ('"credentials": {\n  "value": "plain-secret-value"\n}', "plain-secret"),
+            "key body without begin": ("b3BlbnNzaC1rZXk/dGFpbA+more\n-----END OPENSSH PRIVATE KEY-----", "b3Blbn"),
         }
         for name, (text, secret) in cases.items():
             with self.subTest(name):
@@ -68,6 +71,23 @@ class RedactionTest(unittest.TestCase):
                          {"token": "[REDACTED]", "ok": ["x"]})
         self.assertIn("aaa-111-bbb", found)
 
+    def test_escaped_secret_is_redacted_when_echoed_decoded(self):
+        command, output = friction.clip_fields([('login --password "pa\\"ss-tail"', 200, False),
+                                                ('failed pa"ss-tail', 200, True)])
+        self.assertNotIn("ss-tail", command + output)
+
+    def test_too_many_secrets_omits_the_field(self):
+        command = " ".join(f"token=dummy-secret-{i:03}" for i in range(friction.MAX_SECRETS + 1))
+        command, output = friction.clip_fields([(command, 99999, False), ("echo dummy-secret-064", 200, True)])
+        self.assertIn("omitted", output)
+        self.assertNotIn("dummy-secret-064", command + output)
+
+    def test_long_output_line_is_omitted_even_without_a_label(self):
+        # A harness kept only the tail of "Authorization: Basic qqq...", so no rule can see the label.
+        clipped = friction.clip("q" * 70000 + "\nexit 3", 2000, tail=True)
+        self.assertNotIn("qqqq", clipped)
+        self.assertTrue(clipped.endswith("exit 3"))
+
     def test_line_longer_than_redaction_window_is_omitted(self):
         text = "Authorization: Bearer " + "x" * friction.REDACT_WINDOW
         self.assertIn("omitted", friction.clip(text, 100, tail=True))
@@ -90,6 +110,7 @@ class ClassificationTest(unittest.TestCase):
             ("rg needle 2>/dev/null", "", True),
             ("grep needle < /missing", "bash: /missing: No such file or directory", False),
             ("! grep -q needle file", "", False),
+            ('grep "" empty.txt', "", True),
             ("pnpm test", "", False),
         ):
             with self.subTest(command):
