@@ -87,12 +87,14 @@ MAX_SECRET_LENGTH = 1024
 _CONTAINER = re.compile(rf"(?i){_START}{_NAME}\\?[\"']?\s*[:=]\s*(?=[\[{{])")
 
 
+def is_label(value):
+    # Words that could also be secret labels (password, literal-token-value). See replace_known().
+    return bool(re.fullmatch(r"[A-Za-z_.-]+", value) and re.fullmatch(_NAME, value, re.I))
+
+
 def harvestable(value):
     # Long values, or short ones that are not plain words like true/none, are worth redacting everywhere.
-    # Bare label words (credentials, api_key) are skipped so literal replacement never hides a label.
-    label = re.fullmatch(r"[A-Za-z_.-]+", value) and re.fullmatch(_NAME, value, re.I)
-    return (len(value) >= 8 or (len(value) >= 5 and not value.isalpha())) and len(value) <= MAX_SECRET_LENGTH \
-        and not label
+    return (len(value) >= 8 or (len(value) >= 5 and not value.isalpha())) and len(value) <= MAX_SECRET_LENGTH
 
 
 def harvest(value, found):
@@ -155,8 +157,17 @@ def redact(text, found=None):
     def replace_known(text):
         if not found or len(found) > MAX_SECRETS:
             return text
-        # One alternation pass, longest first, rather than one full scan per secret.
-        return re.compile("|".join(map(re.escape, sorted(found, key=len, reverse=True)))).sub(REDACTED, text)
+        # One alternation pass per kind, longest first, rather than one full scan per secret.
+        plain = sorted((value for value in found if not is_label(value)), key=len, reverse=True)
+        labels = sorted((value for value in found if is_label(value)), key=len, reverse=True)
+        if plain:
+            text = re.compile("|".join(map(re.escape, plain))).sub(REDACTED, text)
+        if labels:
+            # A label-like secret (POSTGRES_PASSWORD=password) is replaced only where it is not acting as a
+            # label (--password x, password=x, "password": x), so the rules can still find the value after it.
+            alternatives = "|".join(map(re.escape, labels))
+            text = re.sub(rf"(?<![\w-])(?:{alternatives})(?![\w-]|\\?[\"']?\s*[:=])", REDACTED, text)
+        return text
 
     # Known secrets go first, whole, before label rules can split them (password=a,b;c); and again last
     # for anything harvested meanwhile. Label-like words are never harvested, so neither pass erases labels.

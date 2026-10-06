@@ -92,6 +92,9 @@ class RedactionTest(unittest.TestCase):
         self.assertNotIn("horse", command + output)
         with mock.patch.dict(os.environ, {"SERVICE_PASSWORD": "alpha,beta;gamma"}):
             self.assertNotIn("beta", friction.redact("password=alpha,beta;gamma"))
+        # An env secret that is itself a label word must not erase labels elsewhere.
+        with mock.patch.dict(os.environ, {"POSTGRES_PASSWORD": "password"}):
+            self.assertNotIn("hunter2", friction.redact("login --password hunter2; password=hunter2"))
 
     def test_secret_on_dropped_long_line_is_still_redacted_elsewhere(self):
         text = '{"password":"hunter2","pad":"' + "x" * 5000 + '"}\nlogin failed for hunter2'
