@@ -170,7 +170,7 @@ def redact(text, found=None):
         return text
 
     # Known secrets go first, whole, before label rules can split them (password=a,b;c); and again last
-    # for anything harvested meanwhile. Label-like words are never harvested, so neither pass erases labels.
+    # for anything harvested meanwhile. replace_known() leaves label positions alone, so neither pass erases labels.
     text = replace_known(redact_containers(text, found))
     for pattern, harvested in REDACTIONS:
         def replace(match):
