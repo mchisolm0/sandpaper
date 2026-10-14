@@ -85,9 +85,9 @@ agent to add a note or skip it if the slowness was expected. Each fires once
 per turn, per kind for repeats.
 
 A kind is the program plus a lowercase subcommand (`pnpm test`, `gh run`,
-`sleep`) for each command in a shell string. Read-only commands such as `rg`,
-`cat`, `ls`, `sed`, `jq`, and `git status`/`log`/`diff` are not counted, since
-exploring repeats them all the time. Only shell calls count toward repeats.
+`sleep`) for each command in a shell string. Exploration and editing commands
+such as `rg`, `cat`, `ls`, `sed`, `jq`, and `git status`/`log`/`diff` are not
+counted, since normal work repeats them all the time. Only shell calls count toward repeats.
 
 A turn starts at `UserPromptSubmit` for Claude Code, at a new `turn_id` for
 Codex, and at the user prompt the plugin sees for OpenCode. Codex has no

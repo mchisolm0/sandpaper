@@ -159,6 +159,8 @@ class ClassificationTest(unittest.TestCase):
             ("git status\ngit push", {"git push"}),
             ("pnpm test \\\n  --watch=false", {"pnpm test"}),
             ("python3 - <<'PY'\nimport json\nPY", {"python3"}),
+            ("if command -v pnpm; then pnpm test; fi", {"pnpm test"}),
+            ("for f in a b; do pnpm test $f; done", {"pnpm test"}),
         ):
             with self.subTest(command):
                 self.assertEqual(friction.command_kinds(command), expected)

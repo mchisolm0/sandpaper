@@ -28,10 +28,10 @@ EXPECTED_EXIT_1 = {"rg", "grep", "egrep", "fgrep", "diff", "cmp", "test", "["}
 # A turn that succeeds slowly is friction too: flag it once it runs this long or repeats one command this often.
 SLOW_TURN_MS = 15 * 60 * 1000
 REPEAT_LIMIT = 5
-# Read-only commands agents run many times while exploring, so repeating them is not a signal.
+# Commands agents run many times while exploring or editing, so repeating them is not a signal.
 EXPLORE_COMMANDS = {"rg", "grep", "egrep", "fgrep", "cat", "ls", "sed", "head", "tail", "find", "fd", "wc", "echo",
                     "printf", "pwd", "cd", "test", "[", "diff", "cmp", "jq", "awk", "sort", "uniq", "cut", "tr",
-                    "file", "stat", "which", "tree", "true", "nl"}
+                    "file", "stat", "which", "command", "type", "tree", "true", "nl"}
 EXPLORE_GIT = {"status", "log", "diff", "show", "branch", "rev-parse", "ls-files", "blame", "grep"}
 # Global options whose value is the next argument, so it is not mistaken for a subcommand.
 VALUE_OPTIONS = {"-C", "-c", "-R", "--repo", "--filter", "-F", "--dir", "--prefix", "--cwd"}
@@ -374,10 +374,13 @@ def simple_commands(command):
             skip = False
         elif re.fullmatch(r"time|env|sudo|timeout|nohup|nice", token):
             wrapped = True
+        # Loop and case headers (`for f in a b`) run nothing, so they are consumed but not recorded.
+        elif token in {"for", "case", "select"}:
+            current = []
         # Wrapper options, their values, and durations, e.g. `env -i`, `sudo -u root`, `timeout 300`.
         elif wrapped and re.fullmatch(r"-.*|\d+(?:\.\d+)?[smhd]?", token, re.S):
             skip = token in WRAPPER_VALUE_OPTIONS
-        elif not re.fullmatch(r"\w+=.*|[({!]", token, re.S):
+        elif not re.fullmatch(r"\w+=.*|[({!}]|if|then|else|elif|fi|while|until|do|done|esac", token, re.S):
             current = [token]
             commands.append(current)
     return commands
