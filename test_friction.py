@@ -155,6 +155,7 @@ class ClassificationTest(unittest.TestCase):
             ("git -C repo status", set()),
             ("env -i pnpm test", {"pnpm test"}),
             ("timeout 300 pnpm --filter web test", {"pnpm test"}),
+            ("sudo -u root pnpm test && env -u TOKEN pnpm build", {"pnpm test", "pnpm build"}),
         ):
             with self.subTest(command):
                 self.assertEqual(friction.command_kinds(command), expected)
@@ -213,6 +214,11 @@ class HookTest(unittest.TestCase):
         self.assertEqual((captured["category"], captured["turn"]["id"]), ("slow-turn", "turn"))
         self.assertGreater(captured["turn"]["duration_ms"], friction.SLOW_TURN_MS)
         self.assertIn("this turn has run 16 minutes", json.loads(first))
+        # Without a turn start, a turn begins when its first call did.
+        del call["turn_started_ms"]
+        self.run_script("opencode", event={**call, "session_id": "other", "tool_use_id": "c",
+                                           "duration_ms": friction.SLOW_TURN_MS})
+        self.assertEqual(self.records()[-1]["category"], "slow-turn")
 
     def test_install_check_uninstall_preserves_other_settings(self):
         settings = self.home / ".claude/settings.json"
@@ -223,6 +229,17 @@ class HookTest(unittest.TestCase):
         self.assertEqual(json.loads(settings.read_text())["theme"], "dark")
         self.run_script("uninstall", "all")
         self.assertIn("SessionStart", json.loads(settings.read_text())["hooks"])
+
+    def test_install_replaces_legacy_hook_command(self):
+        settings = self.home / ".claude/settings.json"
+        settings.parent.mkdir()
+        legacy = f"{friction.script_command()} claude"
+        settings.write_text(json.dumps({"hooks": {"PostToolUseFailure": [{"hooks": [{"command": legacy}]}]}}))
+        self.run_script("install", "claude")
+        commands = [hook["command"] for entries in json.loads(settings.read_text())["hooks"].values()
+                    for entry in entries for hook in entry["hooks"]]
+        self.assertNotIn(legacy, commands)
+        self.assertEqual(len(commands), 3)
         self.assertFalse((self.home / ".config/opencode/plugins/friction.ts").exists())
 
     def test_opencode_plugin_follows_installed_major_version(self):

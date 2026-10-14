@@ -35,6 +35,9 @@ EXPLORE_COMMANDS = {"rg", "grep", "egrep", "fgrep", "cat", "ls", "sed", "head", 
 EXPLORE_GIT = {"status", "log", "diff", "show", "branch", "rev-parse", "ls-files", "blame", "grep"}
 # Global options whose value is the next argument, so it is not mistaken for a subcommand.
 VALUE_OPTIONS = {"-C", "-c", "-R", "--repo", "--filter", "-F", "--dir", "--prefix", "--cwd"}
+# Options of env, sudo, timeout, and nice that take the next argument as their value.
+WRAPPER_VALUE_OPTIONS = {"-u", "-g", "-C", "-D", "-s", "-k", "-n", "--user", "--group", "--unset", "--chdir",
+                         "--signal", "--kill-after", "--adjustment"}
 # Only these get a --version probe: rerunning an arbitrary failed command could have side effects.
 VERSIONED_TOOLS = {"git", "gh", "rg", "grep", "jq", "make", "node", "bun", "deno", "pnpm", "npm", "npx", "yarn",
                    "python", "python3", "uv", "pip", "cargo", "rustc", "docker", "tsc", "mise", "curl"}
@@ -356,17 +359,20 @@ def simple_commands(command):
     tokens = shell_tokens(command)
     if tokens is None:
         return None
-    commands, current, wrapped = [], None, False
+    commands, current, wrapped, skip = [], None, False, False
     for token in tokens:
         if token in {"|", "||", "&&", ";", "&", "|&"}:
-            current, wrapped = None, False
+            current, wrapped, skip = None, False, False
         elif current is not None:
             current.append(token)
+        elif skip:
+            skip = False
         elif re.fullmatch(r"time|env|sudo|timeout|nohup|nice", token):
             wrapped = True
-        # Wrapper options and durations, e.g. `env -i`, `timeout 300`.
-        elif not (wrapped and re.fullmatch(r"-.*|\d+(?:\.\d+)?[smhd]?", token, re.S)) \
-                and not re.fullmatch(r"\w+=.*|[({!]", token, re.S):
+        # Wrapper options, their values, and durations, e.g. `env -i`, `sudo -u root`, `timeout 300`.
+        elif wrapped and re.fullmatch(r"-.*|\d+(?:\.\d+)?[smhd]?", token, re.S):
+            skip = token in WRAPPER_VALUE_OPTIONS
+        elif not re.fullmatch(r"\w+=.*|[({!]", token, re.S):
             current = [token]
             commands.append(current)
     return commands
@@ -450,8 +456,11 @@ def track_turn(source, event):
         row = db.execute("SELECT turn, started, state FROM turns WHERE session = ?", (session,)).fetchone()
         turn_id = event.get("turn_id") if isinstance(event.get("turn_id"), str) else None
         if row is None or prompt or (turn_id and turn_id != row[0]):
+            # Without a prompt hook the turn is first seen when a call ends, so it began at least when that call did.
             started = event.get("turn_started_ms")
-            row = (turn_id or uuid.uuid4().hex, started if type(started) is int else now, '{"calls": 0, "repeats": {}}')
+            if type(started) is not int:
+                started = now - ((call and call["duration_ms"]) or 0)
+            row = (turn_id or uuid.uuid4().hex, started, '{"calls": 0, "repeats": {}}')
         turn, started, saved = row
         saved = json.loads(saved)
         tripped = []
@@ -841,20 +850,22 @@ def edit_hooks(agent, action):
     present = []
     for event, matcher, adapter in hook_specs(agent):
         command = hook_command(adapter)
+        # Earlier versions registered friction.py itself. Install replaces that command and uninstall removes it.
+        stale = {f"{script_command()} {adapter}"} | ({command} if action == "uninstall" else set())
         entries = hooks.setdefault(event, [])
-        found = any(hook.get("command") == command for entry in entries
-                    for hook in entry.get("hooks", []))
+        commands = {hook.get("command") for entry in entries for hook in entry.get("hooks", [])}
+        found = command in commands
         present.append(found)
+        if action != "check" and commands & stale:
+            for entry in entries:
+                entry["hooks"] = [hook for hook in entry.get("hooks", []) if hook.get("command") not in stale]
+            entries[:] = [entry for entry in entries if entry.get("hooks")]
+            changed = True
         if action == "install" and not found:
             entry = {"hooks": [{"type": "command", "command": command, "timeout": 40}]}
             if matcher:
                 entry["matcher"] = matcher
             entries.append(entry)
-            changed = True
-        if action == "uninstall" and found:
-            for entry in entries:
-                entry["hooks"] = [hook for hook in entry.get("hooks", []) if hook.get("command") != command]
-            hooks[event] = [entry for entry in entries if entry.get("hooks")]
             changed = True
     if changed:
         path.parent.mkdir(parents=True, exist_ok=True)

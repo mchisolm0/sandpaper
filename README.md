@@ -91,7 +91,8 @@ exploring repeats them all the time. Only shell calls count toward repeats.
 
 A turn starts at `UserPromptSubmit` for Claude Code, at a new `turn_id` for
 Codex, and at the user prompt the plugin sees for OpenCode. Codex has no
-prompt hook here, so its turns are timed from their first tool call. Turn
+prompt hook here, so its turns are timed from the start of their first tool
+call. Turn
 state lives in the SQLite file, one row per session.
 
 ## Hook payloads
@@ -162,9 +163,8 @@ crash between append and deduplication can leave a duplicate record.
 
 Hooks run `friction_hook.py`, which imports `friction.py` so Python reuses its
 cached bytecode; modules only needed to capture an event load on demand.
-Earlier versions registered `friction.py` itself. Run `uninstall all` with
-that version before installing this one, or both hooks fire and turns are
-counted twice.
+Earlier versions registered `friction.py` itself; `install` replaces those
+hooks and `uninstall` removes them.
 
 Earlier versions wrote `friction.md`. It is left in place and no longer
 written.
