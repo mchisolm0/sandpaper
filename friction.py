@@ -346,7 +346,9 @@ def response_text(response):
 
 def shell_tokens(command):
     try:
-        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+        # Newlines separate commands like `;`, so they are punctuation, after joining `\` line continuations.
+        lexer = shlex.shlex(command.replace("\\\n", " "), posix=True, punctuation_chars="();<>|&\n")
+        lexer.whitespace = " \t\r"
         lexer.whitespace_split = True
         return list(lexer)
     except ValueError:
@@ -361,7 +363,10 @@ def simple_commands(command):
         return None
     commands, current, wrapped, skip = [], None, False, False
     for token in tokens:
-        if token in {"|", "||", "&&", ";", "&", "|&"}:
+        # A heredoc body is data, not commands; anything after it is rare enough to ignore.
+        if token == "<<":
+            break
+        if re.fullmatch(r"[|&;\n]+", token):
             current, wrapped, skip = None, False, False
         elif current is not None:
             current.append(token)

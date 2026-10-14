@@ -156,6 +156,9 @@ class ClassificationTest(unittest.TestCase):
             ("env -i pnpm test", {"pnpm test"}),
             ("timeout 300 pnpm --filter web test", {"pnpm test"}),
             ("sudo -u root pnpm test && env -u TOKEN pnpm build", {"pnpm test", "pnpm build"}),
+            ("git status\ngit push", {"git push"}),
+            ("pnpm test \\\n  --watch=false", {"pnpm test"}),
+            ("python3 - <<'PY'\nimport json\nPY", {"python3"}),
         ):
             with self.subTest(command):
                 self.assertEqual(friction.command_kinds(command), expected)
