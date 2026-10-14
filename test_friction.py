@@ -152,6 +152,9 @@ class ClassificationTest(unittest.TestCase):
             ("rg needle src | head", set()),
             ("git status && git diff", set()),
             ("git push origin main", {"git push"}),
+            ("git -C repo status", set()),
+            ("env -i pnpm test", {"pnpm test"}),
+            ("timeout 300 pnpm --filter web test", {"pnpm test"}),
         ):
             with self.subTest(command):
                 self.assertEqual(friction.command_kinds(command), expected)

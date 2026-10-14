@@ -33,6 +33,8 @@ EXPLORE_COMMANDS = {"rg", "grep", "egrep", "fgrep", "cat", "ls", "sed", "head", 
                     "printf", "pwd", "cd", "test", "[", "diff", "cmp", "jq", "awk", "sort", "uniq", "cut", "tr",
                     "file", "stat", "which", "tree", "true", "nl"}
 EXPLORE_GIT = {"status", "log", "diff", "show", "branch", "rev-parse", "ls-files", "blame", "grep"}
+# Global options whose value is the next argument, so it is not mistaken for a subcommand.
+VALUE_OPTIONS = {"-C", "-c", "-R", "--repo", "--filter", "-F", "--dir", "--prefix", "--cwd"}
 # Only these get a --version probe: rerunning an arbitrary failed command could have side effects.
 VERSIONED_TOOLS = {"git", "gh", "rg", "grep", "jq", "make", "node", "bun", "deno", "pnpm", "npm", "npx", "yarn",
                    "python", "python3", "uv", "pip", "cargo", "rustc", "docker", "tsc", "mise", "curl"}
@@ -354,13 +356,17 @@ def simple_commands(command):
     tokens = shell_tokens(command)
     if tokens is None:
         return None
-    commands, current = [], None
+    commands, current, wrapped = [], None, False
     for token in tokens:
         if token in {"|", "||", "&&", ";", "&", "|&"}:
-            current = None
+            current, wrapped = None, False
         elif current is not None:
             current.append(token)
-        elif not re.fullmatch(r"\w+=.*|[({!]|time|env|sudo", token, re.S):
+        elif re.fullmatch(r"time|env|sudo|timeout|nohup|nice", token):
+            wrapped = True
+        # Wrapper options and durations, e.g. `env -i`, `timeout 300`.
+        elif not (wrapped and re.fullmatch(r"-.*|\d+(?:\.\d+)?[smhd]?", token, re.S)) \
+                and not re.fullmatch(r"\w+=.*|[({!]", token, re.S):
             current = [token]
             commands.append(current)
     return commands
@@ -377,7 +383,10 @@ def command_kinds(command):
     kinds = set()
     for argv in simple_commands(command) or []:
         name = Path(argv[0]).name
-        sub = argv[1] if len(argv) > 1 and re.fullmatch(r"[a-z][\w:-]*", argv[1]) else None
+        # The subcommand is the first positional argument, past options like `git -C repo` or `pnpm --filter web`.
+        positional = [arg for previous, arg in zip(argv, argv[1:])
+                      if not arg.startswith("-") and previous not in VALUE_OPTIONS]
+        sub = positional[0] if positional and re.fullmatch(r"[a-z][\w:-]*", positional[0]) else None
         if name not in EXPLORE_COMMANDS and not (name == "git" and sub in EXPLORE_GIT):
             kinds.add(f"{name} {sub}" if sub else name)
     return kinds
