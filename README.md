@@ -80,7 +80,7 @@ Group by `id`/`event` to join them, e.g.
 
 Slow work that succeeds never fails a tool call, so every hooked call also
 counts toward its turn. The first call after a turn passes 15 minutes, and the
-5th run of one command kind in a turn, each record an event and remind the
+5th call in a turn that runs one command kind, each record an event and remind the
 agent to add a note or skip it if the slowness was expected. Each fires once
 per turn, per kind for repeats.
 
