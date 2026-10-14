@@ -10,6 +10,7 @@ from unittest import mock
 
 
 SCRIPT = Path(__file__).with_name("friction.py")
+HOOK = Path(__file__).with_name("friction_hook.py")
 spec = importlib.util.spec_from_file_location("friction", SCRIPT)
 friction = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(friction)
@@ -142,6 +143,19 @@ class ClassificationTest(unittest.TestCase):
             with self.subTest(command):
                 self.assertEqual(friction.low_signal(command, 1, output), expected)
 
+    def test_command_kinds(self):
+        for command, expected in (
+            ("pnpm test", {"pnpm test"}),
+            ("cd web && CI=1 pnpm test --watch=false", {"pnpm test"}),
+            ("gh run view 123 --log | tail -50", {"gh run"}),
+            ("sleep 30", {"sleep"}),
+            ("rg needle src | head", set()),
+            ("git status && git diff", set()),
+            ("git push origin main", {"git push"}),
+        ):
+            with self.subTest(command):
+                self.assertEqual(friction.command_kinds(command), expected)
+
 
 class HookTest(unittest.TestCase):
     def setUp(self):
@@ -151,7 +165,9 @@ class HookTest(unittest.TestCase):
         self.env = {**os.environ, "HOME": directory.name, "FRICTION_DIR": str(self.home / "reports")}
 
     def run_script(self, *args, event=None, check=True):
-        return subprocess.run([sys.executable, str(SCRIPT), *args], input=json.dumps(event) if event else None,
+        # Hooks run through the shim, as installed; the CLI runs friction.py directly.
+        script = HOOK if args[0] in {"claude", "codex", "codex-shell", "opencode"} else SCRIPT
+        return subprocess.run([sys.executable, str(script), *args], input=json.dumps(event) if event else None,
                               text=True, env=self.env, capture_output=True, check=check)
 
     def records(self):
@@ -162,6 +178,38 @@ class HookTest(unittest.TestCase):
         return {"hook_event_name": "PostToolUseFailure", "session_id": "session", "tool_use_id": call,
                 "cwd": str(SCRIPT.parent), "tool_name": "Bash", "tool_input": {"command": command},
                 "error": error, "is_interrupt": False, "duration_ms": 217}
+
+    def claude_call(self, call, command, event="PostToolUse"):
+        return {"hook_event_name": event, "session_id": "session", "tool_use_id": call, "cwd": str(SCRIPT.parent),
+                "tool_name": "Bash", "tool_input": {"command": command},
+                "tool_response": {"stdout": "", "stderr": "", "interrupted": False}}
+
+    def test_repeated_command_is_flagged_once_per_turn(self):
+        prompt = {"hook_event_name": "UserPromptSubmit", "session_id": "session", "prompt": "fix it"}
+        self.run_script("claude", event=prompt)
+        outputs = [self.run_script("claude", event=self.claude_call(f"rg{i}", "rg needle")).stdout for i in range(6)]
+        outputs += [self.run_script("claude", event=self.claude_call(f"t{i}", "pnpm test")).stdout for i in range(6)]
+        self.assertEqual([bool(output) for output in outputs], [False] * 10 + [True, False])
+        [captured] = self.records()
+        self.assertEqual((captured["category"], captured["tool"]["input"]), ("repeated-command", "pnpm test"))
+        self.assertEqual((captured["turn"]["calls"], captured["turn"]["repeats"]), (11, {"pnpm test": 5}))
+        self.assertIn(f"--event {captured['id']}", json.loads(outputs[10])["hookSpecificOutput"]["additionalContext"])
+        # A new prompt starts a new turn, so four more runs stay under the limit.
+        self.run_script("claude", event=prompt)
+        for i in range(4):
+            self.run_script("claude", event=self.claude_call(f"next{i}", "pnpm test"))
+        self.assertEqual(len(self.records()), 1)
+
+    def test_slow_turn_is_flagged_once(self):
+        started = friction.now_ms() - friction.SLOW_TURN_MS - 60_000
+        call = {"hook_event_name": "PostToolUse", "session_id": "session", "tool_name": "read", "tool_input": {},
+                "tool_response": {"output": "ok"}, "turn_id": "turn", "turn_started_ms": started}
+        first = self.run_script("opencode", event={**call, "tool_use_id": "a"}).stdout
+        self.run_script("opencode", event={**call, "tool_use_id": "b"})
+        [captured] = self.records()
+        self.assertEqual((captured["category"], captured["turn"]["id"]), ("slow-turn", "turn"))
+        self.assertGreater(captured["turn"]["duration_ms"], friction.SLOW_TURN_MS)
+        self.assertIn("this turn has run 16 minutes", json.loads(first))
 
     def test_install_check_uninstall_preserves_other_settings(self):
         settings = self.home / ".claude/settings.json"
