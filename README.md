@@ -1,8 +1,9 @@
 # Friction logger proof of concept
 
 A local failure log for Claude Code, Codex, and OpenCode. Hooks record each
-failed tool call as a redacted JSONL event with enough context to diagnose it,
-then ask the agent to attach a short note to that same event.
+failed tool call, and each turn that runs long or keeps repeating a command, as
+a redacted JSONL event with enough context to diagnose it, then ask the agent
+to attach a short note to that same event.
 
 Requires Python 3.9+. Live sessions on Linux were checked with Claude Code
 2.1.285, Codex CLI 0.159.0, and OpenCode 2.0.23. OpenCode has two plugins:
@@ -56,7 +57,10 @@ Every record has `schema` (currently `1`) and `kind`. An `event` looks like:
   printed. Negated commands (`! grep`) are never low. Low
   events are recorded without prompting the agent or probing tool versions.
 - `category` is `exit-N`, `tool-error`, `timeout`, `permission-denied`,
-  `authentication`, `rate-limit`, `missing-file`, `patch-mismatch`, or `manual`.
+  `authentication`, `rate-limit`, `missing-file`, `patch-mismatch`, `manual`,
+  `slow-turn`, or `repeated-command`. The last two describe the turn, not a
+  failure: `tool` is the call that crossed the threshold, and a `turn` field
+  holds `id`, `duration_ms`, `calls`, and `repeats` (kinds run more than once).
 - `host.name` is the Tailscale machine name when available, else the hostname.
 - `tool.versions` only covers an allowlist of well-known tools, since rerunning
   an arbitrary failed command with `--version` could have side effects.
@@ -72,11 +76,30 @@ A `note` links to its event by id:
 Group by `id`/`event` to join them, e.g.
 `jq -s 'group_by(.id // .event)' events.jsonl`.
 
+## Slow turns
+
+Slow work that succeeds never fails a tool call, so every hooked call also
+counts toward its turn. The first call after a turn passes 15 minutes, and the
+5th call in a turn that runs one command kind, each record an event and remind the
+agent to add a note or skip it if the slowness was expected. Each fires once
+per turn, per kind for repeats.
+
+A kind is the program plus a lowercase subcommand (`pnpm test`, `gh run`,
+`sleep`) for each command in a shell string. Exploration and editing commands
+such as `rg`, `cat`, `ls`, `sed`, `jq`, and `git status`/`log`/`diff` are not
+counted, since normal work repeats them all the time. Only shell calls count toward repeats.
+
+A turn starts at `UserPromptSubmit` for Claude Code, at a new `turn_id` for
+Codex, and at the user prompt the plugin sees for OpenCode. Codex has no
+prompt hook here, so its turns are timed from the start of their first tool
+call. Turn
+state lives in the SQLite file, one row per session.
+
 ## Hook payloads
 
 | Field | Claude Code | Codex | OpenCode 2.x | OpenCode 1.x |
 | --- | --- | --- | --- | --- |
-| Trigger | `PostToolUseFailure` | `PostToolUse`, all calls | `tool.hook("execute.after")`, nonzero exit or error | `tool.execute.after` and error events |
+| Trigger | `PostToolUseFailure`, `PostToolUse`, `UserPromptSubmit` | `PostToolUse`, all calls | `tool.hook("execute.after")`, all calls; `session.hook("prompt")` | `tool.execute.after`, all calls; error events; `chat.message` |
 | `tool.input` | `tool_input.command`, else `tool_input` | same; Bash is unwrapped first | `input` | tool args |
 | `exit_code` | `Exit code N` in `error` | `exit_code`, `Exit code N`, or wrapper marker | `result.output.exit` | `metadata.exit` |
 | `duration_ms` | `duration_ms` | `duration_ms`, else wrapper start time | timed in plugin | timed in plugin |
@@ -126,16 +149,22 @@ omitted rather than partly redacted.
 The installer adds only its own hooks to `~/.claude/settings.json` and
 `~/.codex/hooks.json`, and writes `~/.config/opencode/plugins/friction.ts`.
 Uninstall removes only those entries. It refuses to overwrite a different
-OpenCode plugin at that path.
+OpenCode plugin at that path. Rerun `install` after updating, since new
+versions can add hooks.
 
 Hooks fail open: any error prints one line without payload content and exits
 nonzero, which harnesses treat as non-blocking. Metadata probes (git,
 Tailscale, versions) run in parallel under a two second deadline, and a write
 that waits more than two seconds for the SQLite lock is dropped. Detection is
 best effort. Interruptions are ignored. OpenCode 2.x appends reminders to the
-tool result or error message. OpenCode 1.x appends them to completed nonzero
-results, and its other error path uses an experimental prompt hook. A
+tool result or error message. OpenCode 1.x appends them to completed results,
+and its other error path uses an experimental prompt hook. A
 crash between append and deduplication can leave a duplicate record.
+
+Hooks run `friction_hook.py`, which imports `friction.py` so Python reuses its
+cached bytecode; modules only needed to capture an event load on demand.
+Earlier versions registered `friction.py` itself; `install` replaces those
+hooks and `uninstall` removes them.
 
 Earlier versions wrote `friction.md`. It is left in place and no longer
 written.

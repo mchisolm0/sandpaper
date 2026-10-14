@@ -1,22 +1,21 @@
 #!/usr/bin/env python3
-"""Record agent tool failures as redacted JSONL events that agents can annotate by event id."""
+"""Record agent tool failures and slow turns as redacted JSONL events that agents can annotate by event id."""
 
-import argparse
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import shlex
-import shutil
 import signal
-import socket
 import sqlite3
-import subprocess
 import sys
 import time
 import uuid
 from datetime import datetime, timezone
+
+# shutil and subprocess are imported where probes use them. Hooks run on every tool call, and most calls record
+# nothing, so they skip that load time.
 
 SCHEMA = 1
 INPUT_LIMIT = 2000
@@ -26,6 +25,19 @@ VERSION_TTL_SECONDS = 600
 SHELL_TOOLS = {"bash", "powershell", "exec_command", "shell", "shell_command"}
 # Exit 1 from these means "no match" or "differs", so it is recorded as low signal.
 EXPECTED_EXIT_1 = {"rg", "grep", "egrep", "fgrep", "diff", "cmp", "test", "["}
+# A turn that succeeds slowly is friction too: flag it once it runs this long or repeats one command this often.
+SLOW_TURN_MS = 15 * 60 * 1000
+REPEAT_LIMIT = 5
+# Commands agents run many times while exploring or editing, so repeating them is not a signal.
+EXPLORE_COMMANDS = {"rg", "grep", "egrep", "fgrep", "cat", "ls", "sed", "head", "tail", "find", "fd", "wc", "echo",
+                    "printf", "pwd", "cd", "test", "[", "diff", "cmp", "jq", "awk", "sort", "uniq", "cut", "tr",
+                    "file", "stat", "which", "command", "type", "tree", "true", "nl"}
+EXPLORE_GIT = {"status", "log", "diff", "show", "branch", "rev-parse", "ls-files", "blame", "grep"}
+# Global options whose value is the next argument, so it is not mistaken for a subcommand.
+VALUE_OPTIONS = {"-C", "-c", "-R", "--repo", "--filter", "-F", "--dir", "--prefix", "--cwd"}
+# Options of env, sudo, timeout, and nice that take the next argument as their value.
+WRAPPER_VALUE_OPTIONS = {"-u", "-g", "-C", "-D", "-s", "-k", "-n", "--user", "--group", "--unset", "--chdir",
+                         "--signal", "--kill-after", "--adjustment"}
 # Only these get a --version probe: rerunning an arbitrary failed command could have side effects.
 VERSIONED_TOOLS = {"git", "gh", "rg", "grep", "jq", "make", "node", "bun", "deno", "pnpm", "npm", "npx", "yarn",
                    "python", "python3", "uv", "pip", "cargo", "rustc", "docker", "tsc", "mise", "curl"}
@@ -334,26 +346,64 @@ def response_text(response):
 
 def shell_tokens(command):
     try:
-        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+        # Newlines separate commands like `;`, so they are punctuation, after joining `\` line continuations.
+        lexer = shlex.shlex(command.replace("\\\n", " "), posix=True, punctuation_chars="();<>|&\n")
+        lexer.whitespace = " \t\r"
         lexer.whitespace_split = True
         return list(lexer)
     except ValueError:
         return None
 
 
-def command_names(command):
-    """argv[0] basenames of each simple command in a shell string, in order; None if it does not parse."""
+def simple_commands(command):
+    """argv of each simple command in a shell string, without leading assignments or wrappers; None if it does
+    not parse."""
     tokens = shell_tokens(command)
     if tokens is None:
         return None
-    names, start = [], True
+    commands, current, wrapped, skip = [], None, False, False
     for token in tokens:
-        if token in {"|", "||", "&&", ";", "&", "|&"}:
-            start = True
-        elif start and not re.fullmatch(r"\w+=.*|[({!]|time|env|sudo", token, re.S):
-            names.append(Path(token).name)
-            start = False
-    return names
+        # A heredoc body is data, not commands; anything after it is rare enough to ignore.
+        if token == "<<":
+            break
+        if re.fullmatch(r"[|&;\n]+", token):
+            current, wrapped, skip = None, False, False
+        elif current is not None:
+            current.append(token)
+        elif skip:
+            skip = False
+        elif re.fullmatch(r"time|env|sudo|timeout|nohup|nice", token):
+            wrapped = True
+        # Loop and case headers (`for f in a b`) run nothing, so they are consumed but not recorded.
+        elif token in {"for", "case", "select"}:
+            current = []
+        # Wrapper options, their values, and durations, e.g. `env -i`, `sudo -u root`, `timeout 300`.
+        elif wrapped and re.fullmatch(r"-.*|\d+(?:\.\d+)?[smhd]?", token, re.S):
+            skip = token in WRAPPER_VALUE_OPTIONS
+        elif not re.fullmatch(r"\w+=.*|[({!}]|if|then|else|elif|fi|while|until|do|done|esac", token, re.S):
+            current = [token]
+            commands.append(current)
+    return commands
+
+
+def command_names(command):
+    """argv[0] basenames of each simple command in a shell string, in order; None if it does not parse."""
+    commands = simple_commands(command)
+    return None if commands is None else [Path(argv[0]).name for argv in commands]
+
+
+def command_kinds(command):
+    """Program plus subcommand (`pnpm test`, `gh run`) of each non-exploration command in a shell string."""
+    kinds = set()
+    for argv in simple_commands(command) or []:
+        name = Path(argv[0]).name
+        # The subcommand is the first positional argument, past options like `git -C repo` or `pnpm --filter web`.
+        positional = [arg for previous, arg in zip(argv, argv[1:])
+                      if not arg.startswith("-") and previous not in VALUE_OPTIONS]
+        sub = positional[0] if positional and re.fullmatch(r"[a-z][\w:-]*", positional[0]) else None
+        if name not in EXPLORE_COMMANDS and not (name == "git" and sub in EXPLORE_GIT):
+            kinds.add(f"{name} {sub}" if sub else name)
+    return kinds
 
 
 def low_signal(command, code, output):
@@ -387,6 +437,75 @@ def categorize(shell, code, message):
     return "tool-error"
 
 
+def track_turn(source, event):
+    """Count a tool call toward its turn. Returns a reminder the first time the turn runs past SLOW_TURN_MS or a
+    command kind reaches REPEAT_LIMIT, so slow work that never fails still gets recorded.
+
+    A turn starts at UserPromptSubmit (Claude Code), when turn_id changes (Codex, OpenCode), or at the first call
+    seen for a session.
+    """
+    session, name = event.get("session_id"), event.get("hook_event_name")
+    prompt = name == "UserPromptSubmit"
+    if not isinstance(session, str) or not session or event.get("is_interrupt") is True:
+        return None
+    if not prompt and name not in {"PostToolUse", "PostToolUseFailure"}:
+        return None
+    now = now_ms()
+    call = None if prompt else tool_call(source, event)
+    if not prompt and call is None:
+        return None
+    kinds = command_kinds(call["command"]) if call and isinstance(call["command"], str) else set()
+    state = output_dir()
+    state.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with sqlite3.connect(state / "friction-hooks.sqlite3", timeout=2) as db:
+        db.execute("CREATE TABLE IF NOT EXISTS turns "
+                   "(session TEXT PRIMARY KEY, turn TEXT, started INTEGER, state TEXT)")
+        db.execute("BEGIN IMMEDIATE")
+        row = db.execute("SELECT turn, started, state FROM turns WHERE session = ?", (session,)).fetchone()
+        turn_id = event.get("turn_id") if isinstance(event.get("turn_id"), str) else None
+        if row is None or prompt or (turn_id and turn_id != row[0]):
+            # Without a prompt hook the turn is first seen when a call ends, so it began at least when that call did.
+            started = event.get("turn_started_ms")
+            if type(started) is not int:
+                started = now - ((call and call["duration_ms"]) or 0)
+            row = (turn_id or uuid.uuid4().hex, started, '{"calls": 0, "repeats": {}}')
+        turn, started, saved = row
+        saved = json.loads(saved)
+        tripped = []
+        if not prompt:
+            saved["calls"] += 1
+            for kind in kinds:
+                saved["repeats"][kind] = saved["repeats"].get(kind, 0) + 1
+                if saved["repeats"][kind] == REPEAT_LIMIT:
+                    tripped.append(("repeated-command", kind))
+            if now - started >= SLOW_TURN_MS and not saved.get("slow"):
+                saved["slow"] = True
+                tripped.append(("slow-turn", None))
+        db.execute("INSERT OR REPLACE INTO turns VALUES (?, ?, ?, ?)", (session, turn, started, json.dumps(saved)))
+    reminders = []
+    for category, kind in tripped:
+        key = hashlib.sha256(json.dumps([source, session, turn, category, kind]).encode()).hexdigest()
+        captured = capture(source, {**call, "key": key, "category": category, "signal": "high"})
+        captured["turn"] = {
+            "id": turn, "duration_ms": now - started, "calls": saved["calls"],
+            "repeats": {scrub(other): count for other, count in saved["repeats"].items() if count > 1},
+        }
+        if not write([captured], key=key):
+            continue
+        if kind:
+            what = f"`{scrub(kind)}` has run {REPEAT_LIMIT} times this turn"
+            why = "you are retrying or polling because something is not working"
+        else:
+            what = f"this turn has run {(now - started) // 60_000} minutes"
+            why = "something slowed you down"
+        reminders.append(
+            f"Friction event {captured['id']}: {what}, recorded with the latest command and environment. If {why}, "
+            f"attach a note: {script_command()} report --event {captured['id']} --expected TEXT --actual TEXT "
+            "--noticed TEXT. Skip it if this was expected. Do not paste secrets. Continue the task."
+        )
+    return "\n".join(reminders) or None
+
+
 def observe(source, event):
     """Normalize a hook payload into failure fields for capture(), or None when the call succeeded."""
     if not isinstance(event, dict):
@@ -394,6 +513,13 @@ def observe(source, event):
     expected_event = "PostToolUseFailure" if source == "claude" else "PostToolUse"
     if event.get("hook_event_name") != expected_event or event.get("is_interrupt") is True:
         return None
+    call = tool_call(source, event)
+    return call if call and call["failed"] else None
+
+
+def tool_call(source, event):
+    """Normalize a PostToolUse or PostToolUseFailure payload into capture() fields plus `failed`. Returns None for
+    this script's own commands, so a failed manual report never creates another report."""
     tool = event.get("tool_name")
     if not isinstance(tool, str) or not tool:
         raise ValueError("missing tool name")
@@ -401,7 +527,8 @@ def observe(source, event):
     inputs = object_value(event.get("tool_input"))
     command = inputs.get("command", inputs.get("cmd"))
     duration = event.get("duration_ms")
-    response = event.get("error") if source == "claude" else event.get("tool_response")
+    claude_failure = event.get("hook_event_name") == "PostToolUseFailure"
+    response = event.get("error") if claude_failure else event.get("tool_response")
     marker_code = None
     if source == "codex" and tool == "Bash" and isinstance(command, str):
         unwrapped = unwrap_codex_shell(key, command)
@@ -413,7 +540,6 @@ def observe(source, event):
             if marker:
                 marker_code = int(marker[1])
                 response = response[:marker.start()]
-    # A failed manual report must not recursively create another report.
     if isinstance(command, str) and re.search(r"\bfriction\.py\b", command):
         return None
     if isinstance(response, str):
@@ -426,21 +552,19 @@ def observe(source, event):
     if code is None:
         code = marker_code
     shell = tool.lower() in SHELL_TOOLS
-    failed = source == "claude" or result.get("isError") is True or result.get("success") is False
+    failed = claude_failure or result.get("isError") is True or result.get("success") is False
     failed = failed or bool(result.get("error")) or result.get("status") in {"error", "failed"}
     if shell and code is not None:
         failed = failed or code != 0
     if isinstance(response, str) and code is None:
         failed = failed or bool(re.match(r"(?:Error:|error:|apply_patch verification failed:)", response))
-    if not failed:
-        return None
     output = response_text(response)
     if not shell:
         command = inputs or None
     elif not isinstance(command, str):
         command = None
     return {
-        "key": key, "tool": tool, "command": command, "exit_code": code,
+        "failed": failed, "key": key, "tool": tool, "command": command, "exit_code": code,
         "duration_ms": duration if type(duration) is int else None, "output": output,
         "category": categorize(shell, code, response if isinstance(response, str) else result.get("error")),
         "signal": "low" if shell and low_signal(command, code, output) else "high",
@@ -453,6 +577,8 @@ def observe(source, event):
 
 def run_probes(commands, cwd):
     """Run metadata commands in parallel under one deadline. Failed or missing commands are omitted."""
+    import subprocess
+
     env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
     running, results = {}, {}
     for name, args in commands.items():
@@ -518,6 +644,8 @@ def harness_version(name):
 def version_keys(names, cwd):
     """Cache keys for each binary found on PATH. They include cwd because version managers like mise
     resolve per directory behind one shim, and the binary mtime so upgrades miss the cache."""
+    import shutil
+
     keys = {}
     for name in names:
         path = shutil.which(name)
@@ -625,7 +753,7 @@ def capture(source, failure):
             "commit": repo[1] if len(repo) == 3 else None,
         },
         "host": {
-            "name": host or socket.gethostname().split(".")[0],
+            "name": host or os.uname().nodename.split(".")[0],
             "via": "tailscale" if host else "hostname",
             "os": sys.platform,
             "arch": os.uname().machine,
@@ -702,13 +830,18 @@ def report(expected, actual, noticed=None, event_id=None):
     return captured["id"]
 
 
+def hook_script():
+    return Path(__file__).resolve().with_name("friction_hook.py")
+
+
 def hook_command(agent):
-    return f"{script_command()} {agent}"
+    return f"{shlex.quote(sys.executable)} {shlex.quote(str(hook_script()))} {agent}"
 
 
 def hook_specs(agent):
     if agent == "claude":
-        return [("PostToolUseFailure", None, "claude")]
+        return [("PostToolUseFailure", None, "claude"), ("PostToolUse", None, "claude"),
+                ("UserPromptSubmit", None, "claude")]
     return [("PostToolUse", None, "codex"), ("PreToolUse", "^Bash$", "codex-shell")]
 
 
@@ -725,20 +858,22 @@ def edit_hooks(agent, action):
     present = []
     for event, matcher, adapter in hook_specs(agent):
         command = hook_command(adapter)
+        # Earlier versions registered friction.py itself. Install replaces that command and uninstall removes it.
+        stale = {f"{script_command()} {adapter}"} | ({command} if action == "uninstall" else set())
         entries = hooks.setdefault(event, [])
-        found = any(hook.get("command") == command for entry in entries
-                    for hook in entry.get("hooks", []))
+        commands = {hook.get("command") for entry in entries for hook in entry.get("hooks", [])}
+        found = command in commands
         present.append(found)
+        if action != "check" and commands & stale:
+            for entry in entries:
+                entry["hooks"] = [hook for hook in entry.get("hooks", []) if hook.get("command") not in stale]
+            entries[:] = [entry for entry in entries if entry.get("hooks")]
+            changed = True
         if action == "install" and not found:
             entry = {"hooks": [{"type": "command", "command": command, "timeout": 40}]}
             if matcher:
                 entry["matcher"] = matcher
             entries.append(entry)
-            changed = True
-        if action == "uninstall" and found:
-            for entry in entries:
-                entry["hooks"] = [hook for hook in entry.get("hooks", []) if hook.get("command") != command]
-            hooks[event] = [entry for entry in entries if entry.get("hooks")]
             changed = True
     if changed:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -748,12 +883,14 @@ def edit_hooks(agent, action):
 
 def edit_opencode(action):
     target = Path.home() / ".config/opencode/plugins/friction.ts"
+    # Earlier releases ran friction.py directly, so legacy detection below matches that path.
     script = json.dumps(str(Path(__file__).resolve()))
     # OpenCode 2 only loads plugins with a default {id, setup} export; 1.x expects named hook factories.
     version = run_probes({"opencode": ["opencode", "--version"]}, None).get("opencode", "")
     major = re.search(r"(\d+)\.\d+", version)
     template = "opencode-friction.ts" if major and int(major[1]) < 2 else "opencode-friction-v2.ts"
-    content = Path(__file__).with_name(template).read_text().replace("__FRICTION_SCRIPT__", script)
+    content = Path(__file__).with_name(template).read_text().replace(
+        "__FRICTION_SCRIPT__", json.dumps(str(hook_script())))
     existing = target.read_text() if target.exists() else None
     installed = existing == content
     # Ours: carries the install marker, or is the unmarked template the first release installed.
@@ -772,6 +909,9 @@ def edit_opencode(action):
 
 
 def command_line():
+    # Imported here so hooks, which run on every tool call, skip its load time.
+    import argparse
+
     parser = argparse.ArgumentParser()
     parser.add_argument("action", choices=["report", "install", "check", "uninstall"])
     parser.add_argument("agent", nargs="?", choices=["claude", "codex", "opencode", "all"])
@@ -815,7 +955,7 @@ def main():
         if output:
             print(json.dumps(output))
         return
-    reminder = record(source, event)
+    reminder = "\n".join(text for text in (record(source, event), track_turn(source, event)) if text)
     if reminder:
         if source == "opencode":
             print(json.dumps(reminder))
@@ -825,7 +965,8 @@ def main():
             }}))
 
 
-if __name__ == "__main__":
+def run():
+    """Script entry point for both friction.py and friction_hook.py."""
     try:
         main()
     except ValueError as error:
@@ -839,3 +980,7 @@ if __name__ == "__main__":
         # Fail open: never block the tool call, and never print payloads or exceptions that may hold credentials.
         print("FRICTION: automatic recording failed. Run friction.py report manually.", file=sys.stderr)
         sys.exit(1)
+
+
+if __name__ == "__main__":
+    run()

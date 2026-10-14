@@ -12,6 +12,8 @@ export const Friction: Plugin = async ({ directory }) => {
   const pending = new Map<string, Promise<void>>();
   const started = new Map<string, number>();
   const agents = new Map<string, { model: string; agent: string }>();
+  // friction.py counts calls per turn; a turn starts at each user message.
+  const turns = new Map<string, { turn_id: string; turn_started_ms: number }>();
   const record = async ({ sessionID, callID, tool, input, response, durationMs }: Call) => {
     try {
       const process = run("python3", [__FRICTION_SCRIPT__, "opencode"], {
@@ -22,7 +24,7 @@ export const Friction: Plugin = async ({ directory }) => {
       process.child.stdin?.end(JSON.stringify({
         hook_event_name: "PostToolUse", session_id: sessionID, tool_use_id: callID, cwd: directory,
         tool_name: tool, tool_input: input, tool_response: response, duration_ms: durationMs,
-        ...agents.get(sessionID),
+        ...agents.get(sessionID), ...turns.get(sessionID),
       }));
       const { stdout } = await process;
       const reminder: unknown = stdout.trim() ? JSON.parse(stdout) : undefined;
@@ -35,17 +37,21 @@ export const Friction: Plugin = async ({ directory }) => {
     "chat.params": async ({ sessionID, agent, model }) => {
       agents.set(sessionID, { model: `${model.providerID}/${model.id}`, agent });
     },
+    "chat.message": async ({ sessionID, messageID }) => {
+      turns.set(sessionID, { turn_id: messageID ?? crypto.randomUUID(), turn_started_ms: Date.now() });
+    },
     "tool.execute.before": async ({ callID }) => {
       started.set(callID, Date.now());
     },
     "tool.execute.after": async ({ tool, sessionID, callID, args }, output) => {
       const start = started.get(callID);
       started.delete(callID);
+      if (output.metadata?.interrupted === true) return;
       const exitCode = output.metadata?.exit;
-      if (typeof exitCode !== "number" || exitCode === 0 || output.metadata?.interrupted === true) return;
+      // Successful calls go too: friction.py flags slow turns and repeated commands.
       const reminder = await record({
         sessionID, callID, tool, input: args,
-        response: { exit_code: exitCode, output: output.output },
+        response: typeof exitCode === "number" ? { exit_code: exitCode, output: output.output } : { output: output.output },
         durationMs: start === undefined ? undefined : Date.now() - start,
       });
       if (reminder) output.output += `\n${reminder}`;
@@ -54,6 +60,7 @@ export const Friction: Plugin = async ({ directory }) => {
       if (event.type === "session.deleted") {
         reminders.delete(event.properties.info.id);
         agents.delete(event.properties.info.id);
+        turns.delete(event.properties.info.id);
         return;
       }
       if (event.type !== "message.part.updated") return;

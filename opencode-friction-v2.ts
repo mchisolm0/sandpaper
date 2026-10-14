@@ -26,16 +26,22 @@ type Context = {
     hook(name: "execute.before", callback: Hook<ToolCall>): Promise<unknown>;
     hook(name: "execute.after", callback: Hook<ToolResult>): Promise<unknown>;
   };
-  session: { get(input: { sessionID: string }): Promise<{ model?: { id: string; providerID: string } } | undefined> };
+  session: {
+    get(input: { sessionID: string }): Promise<{ model?: { id: string; providerID: string } } | undefined>;
+    hook(name: "prompt", callback: Hook<{ sessionID: string; messageID: string }>): Promise<unknown>;
+  };
 };
 
 export default {
   id: "friction",
   setup: async (ctx: Context) => {
     const started = new Map<string, number>();
+    // friction.py counts calls per turn; a turn starts at each user prompt.
+    const turns = new Map<string, { id: string; started: number }>();
     const record = async (call: ToolResult, response: unknown) => {
       const start = started.get(call.id);
       started.delete(call.id);
+      const turn = turns.get(call.sessionID);
       try {
         // Model metadata is optional; never let a stalled lookup hold up the tool call.
         const session = await Promise.race([
@@ -52,6 +58,7 @@ export default {
           cwd: ctx.location.directory, tool_name: call.tool, tool_input: call.input, tool_response: response,
           duration_ms: start === undefined ? undefined : Date.now() - start, agent: call.agent,
           model: session?.model && `${session.model.providerID}/${session.model.id}`, harness_version: ctx.app.version,
+          turn_id: turn?.id, turn_started_ms: turn?.started,
         }));
         const { stdout } = await process;
         const reminder: unknown = stdout.trim() ? JSON.parse(stdout) : undefined;
@@ -60,6 +67,9 @@ export default {
         return "FRICTION: automatic recording failed. Run friction.py report manually, then continue.";
       }
     };
+    await ctx.session.hook("prompt", ({ sessionID, messageID }) => {
+      turns.set(sessionID, { id: messageID, started: Date.now() });
+    });
     await ctx.tool.hook("execute.before", ({ id }) => {
       started.set(id, Date.now());
     });
@@ -69,14 +79,15 @@ export default {
         if (reminder) call.error.message += `\n${reminder}`;
         return;
       }
-      const exit = call.result.output?.exit ?? call.result.metadata?.exit;
-      if (typeof exit !== "number" || exit === 0 || call.result.metadata?.interrupted === true) {
+      if (call.result.metadata?.interrupted === true) {
         started.delete(call.id);
         return;
       }
+      const exit = call.result.output?.exit ?? call.result.metadata?.exit;
       // OpenCode reports empty output as a placeholder; friction.py treats empty output as a signal.
       const output = call.result.output?.output === "(no output)" ? "" : call.result.output?.output ?? "";
-      const reminder = await record(call, { exit_code: exit, output });
+      // Successful calls go too: friction.py flags slow turns and repeated commands.
+      const reminder = await record(call, typeof exit === "number" ? { exit_code: exit, output } : { output });
       if (reminder) call.result.content.push({ type: "text", text: reminder });
     });
   },
