@@ -838,6 +838,18 @@ def hook_command(agent):
     return f"{shlex.quote(sys.executable)} {shlex.quote(str(hook_script()))} {agent}"
 
 
+def registered_hook(command, adapter):
+    """True when command runs this checkout's hook, or the friction.py earlier versions registered, under any Python.
+    Install may run under a different interpreter than the one that registered the hook (e.g. mise vs system)."""
+    if not isinstance(command, str):
+        return False
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return False
+    return argv[-2:] in ([str(hook_script()), adapter], [str(Path(__file__).resolve()), adapter])
+
+
 def hook_specs(agent):
     if agent == "claude":
         return [("PostToolUseFailure", None, "claude"), ("PostToolUse", None, "claude"),
@@ -858,13 +870,14 @@ def edit_hooks(agent, action):
     present = []
     for event, matcher, adapter in hook_specs(agent):
         command = hook_command(adapter)
-        # Earlier versions registered friction.py itself. Install replaces that command and uninstall removes it.
-        stale = {f"{script_command()} {adapter}"} | ({command} if action == "uninstall" else set())
         entries = hooks.setdefault(event, [])
         commands = {hook.get("command") for entry in entries for hook in entry.get("hooks", [])}
         found = command in commands
         present.append(found)
-        if action != "check" and commands & stale:
+        # Install keeps only the current command; uninstall removes every copy.
+        stale = {other for other in commands
+                 if registered_hook(other, adapter) and (action == "uninstall" or other != command)}
+        if action != "check" and stale:
             for entry in entries:
                 entry["hooks"] = [hook for hook in entry.get("hooks", []) if hook.get("command") not in stale]
             entries[:] = [entry for entry in entries if entry.get("hooks")]
