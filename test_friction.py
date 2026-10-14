@@ -235,17 +235,23 @@ class HookTest(unittest.TestCase):
         self.run_script("uninstall", "all")
         self.assertIn("SessionStart", json.loads(settings.read_text())["hooks"])
 
-    def test_install_replaces_legacy_hook_command(self):
+    def test_install_replaces_hooks_registered_by_any_python(self):
         settings = self.home / ".claude/settings.json"
         settings.parent.mkdir()
-        legacy = f"{friction.script_command()} claude"
-        settings.write_text(json.dumps({"hooks": {"PostToolUseFailure": [{"hooks": [{"command": legacy}]}]}}))
-        self.run_script("install", "claude")
-        commands = [hook["command"] for entries in json.loads(settings.read_text())["hooks"].values()
+        stale = [f"{friction.script_command()} claude", f"/opt/mise/python3.13 {HOOK.resolve()} claude"]
+        settings.write_text(json.dumps({"hooks": {"PostToolUseFailure": [{"hooks": [{"command": command}]}
+                                                                         for command in stale]}}))
+
+        def commands():
+            return [hook["command"] for entries in json.loads(settings.read_text())["hooks"].values()
                     for entry in entries for hook in entry["hooks"]]
-        self.assertNotIn(legacy, commands)
-        self.assertEqual(len(commands), 3)
+
+        self.run_script("install", "claude")
+        self.assertEqual(sorted(commands()), sorted(friction.hook_command("claude") for _ in range(3)))
         self.assertFalse((self.home / ".config/opencode/plugins/friction.ts").exists())
+        settings.write_text(json.dumps({"hooks": {"PostToolUse": [{"hooks": [{"command": stale[1]}]}]}}))
+        self.run_script("uninstall", "claude")
+        self.assertEqual(commands(), [])
 
     def test_opencode_plugin_follows_installed_major_version(self):
         bin_dir = self.home / "bin"
