@@ -850,6 +850,10 @@ def registered_hook(command, adapter):
     return argv[-2:] in ([str(hook_script()), adapter], [str(Path(__file__).resolve()), adapter])
 
 
+# Codex's /hooks list titles each hook with its statusMessage; Claude Code shows it while the hook runs.
+STATUS_MESSAGE = "sandpaper: record friction"
+
+
 def hook_specs(agent):
     if agent == "claude":
         return [("PostToolUseFailure", None, "claude"), ("PostToolUse", None, "claude"),
@@ -882,8 +886,14 @@ def edit_hooks(agent, action):
                 entry["hooks"] = [hook for hook in entry.get("hooks", []) if hook.get("command") not in stale]
             entries[:] = [entry for entry in entries if entry.get("hooks")]
             changed = True
+        if action == "install" and found:
+            for hook in (hook for entry in entries for hook in entry.get("hooks", [])):
+                if hook.get("command") == command and hook.get("statusMessage") != STATUS_MESSAGE:
+                    hook["statusMessage"] = STATUS_MESSAGE
+                    changed = True
         if action == "install" and not found:
-            entry = {"hooks": [{"type": "command", "command": command, "timeout": 40}]}
+            entry = {"hooks": [{"type": "command", "command": command, "timeout": 40,
+                                "statusMessage": STATUS_MESSAGE}]}
             if matcher:
                 entry["matcher"] = matcher
             entries.append(entry)

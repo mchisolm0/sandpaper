@@ -25,7 +25,8 @@ python3 friction.py uninstall all
 ```
 
 Codex skips new hooks until you review and trust their definitions with `/hooks`
-in an interactive Codex session. `check` verifies registration, not trust or
+in an interactive Codex session, and again after any change to a hook, such as
+the `statusMessage` label install adds. `check` verifies registration, not trust or
 live delivery. Do not use the CLI's hook-trust bypass for routine sessions.
 
 ## Output

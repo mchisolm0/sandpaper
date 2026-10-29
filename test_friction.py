@@ -253,6 +253,18 @@ class HookTest(unittest.TestCase):
         self.run_script("uninstall", "claude")
         self.assertEqual(commands(), [])
 
+    def test_install_labels_existing_hooks_without_duplicating(self):
+        hooks = self.home / ".codex/hooks.json"
+        hooks.parent.mkdir()
+        command = friction.hook_command("codex")
+        hooks.write_text(json.dumps({"hooks": {"PostToolUse": [{"hooks": [{"command": command}]}]}}))
+        self.run_script("install", "codex")
+        self.run_script("install", "codex")
+        handlers = [hook for entries in json.loads(hooks.read_text())["hooks"].values()
+                    for entry in entries for hook in entry["hooks"]]
+        self.assertEqual(len(handlers), 2)
+        self.assertEqual({hook["statusMessage"] for hook in handlers}, {friction.STATUS_MESSAGE})
+
     def test_opencode_plugin_follows_installed_major_version(self):
         bin_dir = self.home / "bin"
         bin_dir.mkdir()
