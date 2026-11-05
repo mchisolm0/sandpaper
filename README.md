@@ -18,7 +18,7 @@ settles. macOS is untested.
 python3 friction.py install all
 python3 friction.py check all
 # Attach a note to an event from a hook reminder
-python3 friction.py report --event ID --expected 'What should have happened' --actual 'What happened' --noticed 'Likely cause'
+python3 friction.py report --event ID --expected 'What should have happened' --actual 'What happened' --noticed 'Likely cause' --key short-problem-slug
 # Or capture a new event when no hook fired, e.g. a misleading instruction
 python3 friction.py report --expected '...' --actual '...'
 python3 friction.py uninstall all
@@ -73,6 +73,10 @@ A `note` links to its event by id:
 {"schema": 1, "kind": "note", "event": "187b14e0c6adf944", "ts": "...",
  "expected": "build passes", "actual": "missing env", "noticed": "token was stale"}
 ```
+
+`key` is present only when the reporter passed `--key`: a lowercase slug
+naming the problem, reused each time it recurs, so tools that read the log can
+group notes about one problem (for example into one issue per key).
 
 Group by `id`/`event` to join them, e.g.
 `jq -s 'group_by(.id // .event)' events.jsonl`.

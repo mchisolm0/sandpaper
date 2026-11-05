@@ -28,6 +28,8 @@ EXPECTED_EXIT_1 = {"rg", "grep", "egrep", "fgrep", "diff", "cmp", "test", "["}
 # A turn that succeeds slowly is friction too: flag it once it runs this long or repeats one command this often.
 SLOW_TURN_MS = 15 * 60 * 1000
 REPEAT_LIMIT = 5
+# Note keys name a problem across reports, so they stay plain slugs that work as titles.
+KEY_PATTERN = re.compile(r"[a-z0-9][a-z0-9-]*")
 # Commands agents run many times while exploring or editing, so repeating them is not a signal.
 EXPLORE_COMMANDS = {"rg", "grep", "egrep", "fgrep", "cat", "ls", "sed", "head", "tail", "find", "fd", "wc", "echo",
                     "printf", "pwd", "cd", "test", "[", "diff", "cmp", "jq", "awk", "sort", "uniq", "cut", "tr",
@@ -501,7 +503,7 @@ def track_turn(source, event):
         reminders.append(
             f"Friction event {captured['id']}: {what}, recorded with the latest command and environment. If {why}, "
             f"attach a note: {script_command()} report --event {captured['id']} --expected TEXT --actual TEXT "
-            "--noticed TEXT. Skip it if this was expected. Do not paste secrets. Continue the task."
+            "--noticed TEXT --key SLUG, where SLUG names the problem and is reused when it recurs. Skip it if this was expected. Do not paste secrets. Continue the task."
         )
     return "\n".join(reminders) or None
 
@@ -761,14 +763,17 @@ def capture(source, failure):
     }
 
 
-def note(event_id, expected, actual, noticed):
+def note(event_id, expected, actual, noticed, key=None):
     if not expected.strip() or not actual.strip():
         raise ValueError("expected and actual must be nonempty")
+    if key is not None and not KEY_PATTERN.fullmatch(key):
+        raise ValueError("key must be a lowercase slug, like gh-auth-expired")
     expected, actual, noticed = clip_fields([(text, INPUT_LIMIT, False) for text in (expected, actual, noticed)])
     return {
         "schema": SCHEMA, "kind": "note", "event": event_id,
         "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
         "expected": expected, "actual": actual, "noticed": noticed,
+        **({"key": key} if key else {}),
     }
 
 
@@ -815,18 +820,22 @@ def record(source, event):
         f"Friction event {captured['id']}: {source} {captured['tool']['name']} {failure['category']}, recorded with "
         "the command, output tail, and environment. If this failure was unexpected, attach a note to the "
         f"same event: {script_command()} report --event {captured['id']} --expected TEXT --actual TEXT "
-        "--noticed TEXT. Skip it if the failure was expected. Do not paste secrets. Continue the task."
+        "--noticed TEXT --key SLUG, where SLUG names the problem and is reused when it recurs. Skip it if the failure was expected. Do not paste secrets. Continue the task."
     )
 
 
-def report(expected, actual, noticed=None, event_id=None):
-    """Attach a note to an existing event, or capture a new manual event with the note."""
+def report(expected, actual, noticed=None, event_id=None, key=None):
+    """Attach a note to an existing event, or capture a new manual event with the note.
+
+    key: optional slug naming the problem, reused each time it recurs, so a
+    consumer such as an issue sync can group notes about the same problem.
+    """
     if event_id:
-        write([note(event_id, expected, actual, noticed)], event_id=event_id)
+        write([note(event_id, expected, actual, noticed, key)], event_id=event_id)
         return event_id
-    key = uuid.uuid4().hex
-    captured = capture("manual", {"key": key, "category": "manual", "signal": "high"})
-    write([captured, note(captured["id"], expected, actual, noticed)], key=key)
+    dedupe = uuid.uuid4().hex
+    captured = capture("manual", {"key": dedupe, "category": "manual", "signal": "high"})
+    write([captured, note(captured["id"], expected, actual, noticed, key)], key=dedupe)
     return captured["id"]
 
 
@@ -942,10 +951,11 @@ def command_line():
     parser.add_argument("--expected")
     parser.add_argument("--actual")
     parser.add_argument("--noticed")
+    parser.add_argument("--key", help="lowercase slug naming the problem, reused each time it recurs")
     args = parser.parse_args(sys.argv[1:])
     if args.action == "report":
         os.umask(0o077)
-        event_id = report(args.expected or "", args.actual or "", args.noticed, args.event)
+        event_id = report(args.expected or "", args.actual or "", args.noticed, args.event, args.key)
         print(f"Friction note recorded for event {event_id}: {output_dir() / 'events.jsonl'}")
         return
     if not args.agent:
