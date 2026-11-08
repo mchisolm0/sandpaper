@@ -307,6 +307,15 @@ class HookTest(unittest.TestCase):
         rejected = self.run_script("report", "--event", "0000000000000000", "--expected", "x", "--actual", "y", check=False)
         self.assertEqual(rejected.returncode, 2)
 
+    def test_note_key_names_the_problem(self):
+        self.run_script("report", "--expected", "docs match", "--actual", "flag renamed", "--key", "docs-flag-renamed")
+        captured, linked = self.records()
+        self.run_script("report", "--event", captured["id"], "--expected", "x", "--actual", "y")
+        _, _, unkeyed = self.records()
+        self.assertEqual((linked["key"], "key" in unkeyed), ("docs-flag-renamed", False))
+        rejected = self.run_script("report", "--expected", "x", "--actual", "y", "--key", "Not A Slug", check=False)
+        self.assertEqual((rejected.returncode, len(self.records())), (2, 3))
+
     def test_search_without_match_is_low_signal(self):
         output = self.run_script("claude", event=self.claude_failure("rg", "rg -n needle src", "Exit code 1")).stdout
         self.run_script("claude", event=self.claude_failure("cd", "cd missing && rg needle", "Exit code 1\ncd: no such directory"))
